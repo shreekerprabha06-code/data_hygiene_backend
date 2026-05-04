@@ -3,7 +3,7 @@ import os
 import uuid
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError, OperationFailure
 from dotenv import load_dotenv
@@ -20,29 +20,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
  
 load_dotenv()
-
+ 
 # Fields that should NOT trigger a re-validation when updated (Internal statuses)
 INTERNAL_FIELDS = {
-    "stage", "isValid", 
-    "fieldStatus", "invalidPayload", "lastModifiedOn",
-    "benchmarkExecutionID"
+    "stage", "isValid",
+    "fieldStatus", "invalidPayload", "invalidFields", "lastModifiedOn",
+    "benchmarkExecutionID",
+    # Legacy fields that get $unset during pipeline transitions
+    "validated", "standardized", "validation", "standardization"
 }
-
+ 
 # Global cache for the last calculated summary to avoid redundant DB aggregation
 _LAST_SUMMARY = {
     "PENDING": 0, "REJECTED": 0, "ACCEPTED": 0, "ON HOLD": 0, "N/A": 0,
-    "VALIDATION_IN_PROGRESS": 0, "STANDARDIZATION_IN_PROGRESS": 0, "STANDARDIZATION_COMPLETED": 0
+    "VALIDATION_INITIATED": 0, "VALIDATION_IN_PROGRESS": 0,
+    "STANDARDIZATION_IN_PROGRESS": 0, "STANDARDIZATION_COMPLETED": 0,
+    "red": 0, "yellow": 0, "green": 0
 }
 _SUMMARY_LOCK = asyncio.Lock()
-
+ 
 async def get_current_summary(db):
     """Calculates and returns the global summary counts using a single optimized pass."""
+    now = datetime.now(timezone.utc)
+    green_threshold = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    yellow_threshold = (now - timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+ 
     pipeline = [
         {"$match": {"stage": {"$exists": True}}},
         {"$lookup": {
             "from": SNAPSHOT_COL,
             "localField": "benchmarkExecutionID",
             "foreignField": "execution_id",
+            "pipeline": [{"$project": {"data.standardization_status": 1}}],
             "as": "snapshot"
         }},
         {"$unwind": {"path": "$snapshot", "preserveNullAndEmptyArrays": True}},
@@ -51,9 +60,15 @@ async def get_current_summary(db):
                 {"$project": {
                     "status": {
                         "$cond": {
-                            "if": {"$and": [{"$isArray": "$snapshot.data"}, {"$gt": [{"$size": "$snapshot.data"}, 0]}]},
-                            "then": {"$arrayElemAt": ["$snapshot.data.standardization_status", 0]},
-                            "else": "N/A"
+                            "if": {"$ne": ["$stage", "standardization completed"]},
+                            "then": "N/A",
+                            "else": {
+                                "$cond": {
+                                    "if": {"$and": [{"$isArray": "$snapshot.data"}, {"$gt": [{"$size": "$snapshot.data"}, 0]}]},
+                                    "then": {"$arrayElemAt": ["$snapshot.data.standardization_status", 0]},
+                                    "else": "PENDING"
+                                }
+                            }
                         }
                     }
                 }},
@@ -61,63 +76,83 @@ async def get_current_summary(db):
             ],
             "stages": [
                 {"$group": {"_id": "$stage", "count": {"$sum": 1}}}
+            ],
+            "age": [
+                {"$match": {"lastModifiedOn": {"$type": "string"}}},
+                {"$group": {
+                    "_id": {
+                        "$cond": [
+                            {"$gte": ["$lastModifiedOn", green_threshold]}, "green",
+                            {"$cond": [{"$gte": ["$lastModifiedOn", yellow_threshold]}, "yellow", "red"]}
+                        ]
+                    },
+                    "count": {"$sum": 1}
+                }}
             ]
         }}
     ]
-    
+   
     agg_results = await db[EXECUTION_INFO_COL].aggregate(pipeline).to_list(1)
-    facet_res = agg_results[0] if agg_results else {"statuses": [], "stages": []}
-
+    facet_res = agg_results[0] if agg_results else {"statuses": [], "stages": [], "age": []}
+ 
     # Parse Status Counts
     status_counts = {"PENDING": 0, "REJECTED": 0, "ACCEPTED": 0, "ON HOLD": 0, "N/A": 0}
     for s in facet_res["statuses"]:
         key = str(s["_id"] or "N/A").upper()
         if key in status_counts: status_counts[key] = s["count"]
         else: status_counts["N/A"] += s["count"]
-
+ 
     # Parse Stage Counts
     raw_stages = {str(s["_id"] or "unknown").lower(): s["count"] for s in facet_res["stages"]}
     grouped_stages = {
+        "VALIDATION_INITIATED": raw_stages.get("validation initiated", 0),
         "VALIDATION_IN_PROGRESS": (
-            raw_stages.get("validation inprogress", 0) + 
+            raw_stages.get("validation inprogress", 0) +
             raw_stages.get("validation failed", 0)
         ),
+        "VALIDATION_COMPLETED": raw_stages.get("validation completed", 0),
         "STANDARDIZATION_IN_PROGRESS": (
-            raw_stages.get("standardization inprogress", 0) + 
-            raw_stages.get("validation completed", 0) + 
+            raw_stages.get("standardization inprogress", 0) +
             raw_stages.get("standardization failed", 0)
         ),
         "STANDARDIZATION_COMPLETED": raw_stages.get("standardization completed", 0),
         "TOTAL_INVALID_RECORDS": (
-            raw_stages.get("validation inprogress", 0) + 
-            raw_stages.get("validation completed", 0) + 
+            raw_stages.get("validation initiated", 0) +
+            raw_stages.get("validation inprogress", 0) +
+            raw_stages.get("validation completed", 0) +
             raw_stages.get("validation failed", 0) +
-            raw_stages.get("standardization inprogress", 0) + 
+            raw_stages.get("standardization inprogress", 0) +
             raw_stages.get("standardization failed", 0)
         )
     }
-
-    return {**status_counts, **grouped_stages}
-
+ 
+    # Parse Age Counts
+    age_counts = {"red": 0, "yellow": 0, "green": 0}
+    for a in facet_res.get("age", []):
+        if a["_id"] in age_counts:
+            age_counts[a["_id"]] = a["count"]
+ 
+    return {**status_counts, **grouped_stages, **age_counts}
+ 
 async def broadcast_summary(db):
     """Calculates and broadcasts global summary counts."""
     global _LAST_SUMMARY
     summary = await get_current_summary(db)
-    
+   
     async with _SUMMARY_LOCK:
         _LAST_SUMMARY = summary
-
+ 
     await manager.broadcast({
         "type": "PIPELINE_UPDATE",
         "summary": summary
     })
-
-
+ 
+ 
 # ============================================================================
 # PIPELINE 1: VALIDATION
 # Polls for unvalidated records, validates against masterlist, updates ExecutionInfo
 # ============================================================================
-
+ 
 async def validate_document(db, validator, doc):
     """
     Pipeline 1: Validates a single document against the masterlist.
@@ -128,7 +163,7 @@ async def validate_document(db, validator, doc):
         exec_id = doc.get("benchmarkExecutionID")
         if not exec_id:
             exec_id = str(uuid.uuid4())
-
+ 
         # Mark as In Progress and remove legacy fields
         await db[EXECUTION_INFO_COL].update_one(
             {"_id": doc["_id"]},
@@ -140,15 +175,17 @@ async def validate_document(db, validator, doc):
                 "$unset": {"validated": "", "standardized": "", "fieldStatus": "", "invalidPayload": "", "validation": "", "standardization": ""}
             }
         )
-
+       
+        await asyncio.sleep(0.5)  # 500ms yield
+ 
         # Run Validation against masterlist
         invalid_payload, field_status = await validator.validate_doc(db, doc)
         is_val = len(invalid_payload) == 0
-
+ 
         # Update ExecutionInfo with validation result
         # Extract all field names that are in the invalid payload
         invalid_fields = sorted(list(set([p.get("field") for p in invalid_payload])))
-        
+       
         await db[EXECUTION_INFO_COL].update_one(
             {"_id": doc["_id"]},
             {
@@ -162,10 +199,10 @@ async def validate_document(db, validator, doc):
                 }
             }
         )
-
+ 
         status_str = "VALID" if is_val else f"INVALID ({len(invalid_payload)} error groups)"
         logger.info(f"[Validation] COMPLETED: {exec_id} | {status_str}")
-
+ 
         # Broadcast update to UI (Combined with latest summary)
         await manager.broadcast({
             "type": "PIPELINE_UPDATE",
@@ -179,7 +216,7 @@ async def validate_document(db, validator, doc):
             "suggestionsCount": False, # No suggestions until standardization
             "summary": _LAST_SUMMARY
         })
-
+ 
     except Exception as e:
         # Mark as Failed so it can be retried
         await db[EXECUTION_INFO_COL].update_one(
@@ -187,13 +224,64 @@ async def validate_document(db, validator, doc):
             {"$set": {"stage": "validation failed"}}
         )
         logger.error(f"[Validation] FAILED: {doc.get('_id')} | {str(e)}")
-
-
+ 
+ 
+async def validate_document_only(db, validator, doc):
+    """Validates a single document that has ALREADY been marked as 'validation inprogress'.
+    Used by the batch pipeline where the batch marks all records first."""
+    try:
+        exec_id = doc.get("benchmarkExecutionID")
+ 
+        # Run Validation against masterlist
+        invalid_payload, field_status = await validator.validate_doc(db, doc)
+        is_val = len(invalid_payload) == 0
+ 
+        # Extract all field names that are in the invalid payload
+        invalid_fields = sorted(list(set([p.get("field") for p in invalid_payload])))
+       
+        await db[EXECUTION_INFO_COL].update_one(
+            {"_id": doc["_id"]},
+            {
+                "$set": {
+                    "invalidPayload": invalid_payload,
+                    "invalidFields": invalid_fields,
+                    "isValid": is_val,
+                    "stage": "validation completed",
+                    "fieldStatus": field_status,
+                    "lastModifiedOn": datetime.now(timezone.utc).isoformat()
+                }
+            }
+        )
+ 
+        status_str = "VALID" if is_val else f"INVALID ({len(invalid_payload)} error groups)"
+        logger.info(f"[Validation] COMPLETED: {exec_id} | {status_str}")
+ 
+        # Broadcast update to UI
+        await manager.broadcast({
+            "type": "PIPELINE_UPDATE",
+            "execution_id": exec_id,
+            "stage": "validation completed",
+            "isValid": is_val,
+            "invalidFields": invalid_fields,
+            "benchmarkType": doc.get("benchmarkType"),
+            "benchmarkCategory": doc.get("benchmarkCategory"),
+            "updatedOn": datetime.now(timezone.utc).isoformat(),
+            "suggestionsCount": False,
+            "summary": _LAST_SUMMARY
+        })
+ 
+    except Exception as e:
+        await db[EXECUTION_INFO_COL].update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"stage": "validation failed"}}
+        )
+        logger.error(f"[Validation] FAILED: {doc.get('_id')} | {str(e)}")
+ 
 # ============================================================================
 # PIPELINE 2: STANDARDIZATION
 # Polls for validated-but-not-standardized records, creates/updates snapshots
 # ============================================================================
-
+ 
 async def standardize_document(db, validator, doc):
     """
     Pipeline 2: Creates/updates the snapshot for a validated document.
@@ -203,22 +291,22 @@ async def standardize_document(db, validator, doc):
     try:
         exec_id = doc.get("benchmarkExecutionID")
         logger.info(f"[Standardization] IN_PROGRESS: {exec_id}")
-        
+       
         # Mark as In Progress in DB
         await db[EXECUTION_INFO_COL].update_one(
             {"_id": doc["_id"]},
             {"$set": {"stage": "standardization inprogress"}}
         )
-        
+       
         is_val = doc.get("isValid", False)
         invalid_payload = doc.get("invalidPayload", [])
-
+ 
         # Fetch existing snapshot (if any) for history preservation
         latest_snap = await db[SNAPSHOT_COL].find_one(
             {"execution_id": exec_id},
             {"data": {"$slice": 1}, "snapshot_id": 1}
         )
-
+ 
         if is_val:
             # Record is VALID - Only update if a snapshot ALREADY exists (History Preservation)
             if latest_snap and latest_snap.get("data"):
@@ -241,16 +329,16 @@ async def standardize_document(db, validator, doc):
                 snap_id = latest_snap.get("snapshot_id", snap_id)
                 if latest_snap.get("data"):
                     prev_data = latest_snap["data"][0]
-
+ 
             # Normalize status to uppercase, defaults to PENDING
             raw_status = prev_data.get("standardization_status", "PENDING")
             status_val = raw_status.upper() if raw_status else "PENDING"
-
+ 
             clean_meta = []
             for p in invalid_payload:
                 field = p.get("field")
                 val = p.get("value")
-
+ 
                 p_clean = {
                     "field": field,
                     "currentStatus": "invalid",
@@ -260,10 +348,10 @@ async def standardize_document(db, validator, doc):
                     "mapping": p.get("mapping", "")
                 }
                 actual_meta_vals = {m["name"]: m.get("value", "") for m in p.get("metadata", []) if m.get("name")}
-
+ 
                 # Get record-level suggestions using 'Mega-String' fuzzy matching
                 record_suggestions = validator.get_record_level_suggestions(field, val, actual_meta_vals)
-
+ 
                 # Build formatted suggestions for the dashboard
                 primary_comparing = []
                 for i, rec_sug in enumerate(record_suggestions, 1):
@@ -274,7 +362,7 @@ async def standardize_document(db, validator, doc):
                         "_id": rec_sug["_id"]
                     })
                 p_clean["comparingData"] = primary_comparing
-
+ 
                 meta_list = []
                 for m in p.get("metadata", []):
                     m_clean = dict(m)
@@ -292,7 +380,7 @@ async def standardize_document(db, validator, doc):
                     meta_list.append(m_clean)
                 p_clean["metadata"] = meta_list
                 clean_meta.append(p_clean)
-
+ 
             snapshot_doc = {
                 "snapshot_id": snap_id,
                 "execution_id": exec_id,
@@ -312,15 +400,37 @@ async def standardize_document(db, validator, doc):
                     })
                 }]
             }
-
+ 
             await db[SNAPSHOT_COL].replace_one(
                 {"execution_id": exec_id},
                 snapshot_doc,
                 upsert=True
             )
             logger.info(f"[Standardization] COMPLETED: {exec_id} | Snapshot created")
-
-            # Broadcast update to UI (Combined with latest summary)
+ 
+        # Mark as Completed and remove legacy/internal fields
+        # IMPORTANT: This must happen BEFORE the broadcast to avoid race conditions
+        # where the UI fetches the record before the DB is updated.
+        await db[EXECUTION_INFO_COL].update_one(
+            {"_id": doc["_id"]},
+            {
+                "$set": {
+                    "stage": "standardization completed",
+                    "lastModifiedOn": datetime.now(timezone.utc).isoformat()
+                },
+                "$unset": {
+                    "validated": "",
+                    "standardized": "",
+                    "fieldStatus": "",
+                    "invalidPayload": "",
+                    "validation": "",
+                    "standardization": ""
+                }
+            }
+        )
+ 
+        # Broadcast AFTER DB commit so the UI always reads the correct state
+        if not is_val:
             await manager.broadcast({
                 "type": "PIPELINE_UPDATE",
                 "execution_id": exec_id,
@@ -333,23 +443,7 @@ async def standardize_document(db, validator, doc):
                 "suggestionsCount": len(snapshot_doc["data"][0]["invalidFields"]) > 0,
                 "summary": _LAST_SUMMARY
             })
-
-        # Mark as Completed and remove legacy/internal fields
-        await db[EXECUTION_INFO_COL].update_one(
-            {"_id": doc["_id"]},
-            {
-                "$set": {"stage": "standardization completed"},
-                "$unset": {
-                    "validated": "", 
-                    "standardized": "",
-                    "fieldStatus": "",
-                    "invalidPayload": "",
-                    "validation": "",
-                    "standardization": ""
-                }
-            }
-        )
-
+ 
     except Exception as e:
         # Mark as Failed so it can be retried
         await db[EXECUTION_INFO_COL].update_one(
@@ -357,101 +451,143 @@ async def standardize_document(db, validator, doc):
             {"$set": {"stage": "standardization failed"}}
         )
         logger.error(f"[Standardization] FAILED: {doc.get('_id')} | {str(e)}")
-
-
+ 
+ 
 # ============================================================================
 # PARALLEL PIPELINE RUNNERS
 # ============================================================================
-
+ 
 # Global timestamp to debounce broadcasts (prevent DB saturation)
 LAST_BROADCAST_TIME = 0
 BROADCAST_LOCK = asyncio.Lock()
-
+ 
 async def debounced_broadcast(db):
     """Broadcasts summary at most once every 2 seconds."""
     global LAST_BROADCAST_TIME
     current_time = time.time()
-    
+   
     if current_time - LAST_BROADCAST_TIME > 2:
         async with BROADCAST_LOCK:
             # Double check inside lock
             if time.time() - LAST_BROADCAST_TIME > 2:
                 await broadcast_summary(db)
                 LAST_BROADCAST_TIME = time.time()
-
-async def run_validation_pipeline(db, validator, collection_name, interval=1, max_concurrent=50):
-    """Pipeline 1: Streaming Validation with debounced updates."""
-    logger.info(f"[VALIDATION PIPELINE] Started (Streaming, Concurrency: {max_concurrent})")
+ 
+async def run_validation_pipeline(db, validator, collection_name, interval=1, batch_size=50):
+    """Pipeline 1: Batch-Mark-Then-Process Validation.
+   
+    Picks up `batch_size` records at once, marks ALL of them as 'validation inprogress'
+    so the UI can see the full batch, then processes them one by one.
+    """
+    logger.info(f"[VALIDATION PIPELINE] Started (Batch Size: {batch_size})")
     collection = db[collection_name]
-    semaphore = asyncio.Semaphore(max_concurrent)
-    active_tasks = set()
-
+ 
     while True:
         try:
-            query = {"$or": [{"stage": {"$exists": False}}, {"stage": "validation failed"}]}
-            slots_available = max_concurrent - len(active_tasks)
-            
-            if slots_available > 0:
-                async for doc in collection.find(query).limit(slots_available):
-                    async def _run_task(d):
-                        async with semaphore:
-                            await validate_document(db, validator, d)
-                            await debounced_broadcast(db)
-
-                    task = asyncio.create_task(_run_task(doc))
-                    active_tasks.add(task)
-                    task.add_done_callback(active_tasks.discard)
-
-            if len(active_tasks) > 0:
-                await asyncio.sleep(0.1)
-            else:
+            query = {"stage": {"$in": ["validation initiated", "validation failed"]}}
+           
+            # 1. Pick up a batch of records that are queued for validation
+            batch_docs = await collection.find(query).limit(batch_size).to_list(batch_size)
+           
+            if not batch_docs:
                 await asyncio.sleep(interval)
+                continue
+           
+            # 2. Mark ALL records in the batch as "validation inprogress" at once
+            batch_ids = [doc["_id"] for doc in batch_docs]
+            # Assign execution IDs to any docs missing them
+            for doc in batch_docs:
+                if not doc.get("benchmarkExecutionID"):
+                    doc["benchmarkExecutionID"] = str(uuid.uuid4())
+           
+            await collection.update_many(
+                {"_id": {"$in": batch_ids}},
+                {
+                    "$set": {"stage": "validation inprogress"},
+                    "$unset": {"validated": "", "standardized": "", "fieldStatus": "", "invalidPayload": "", "validation": "", "standardization": ""}
+                }
+            )
+            # Also set any generated execution IDs
+            for doc in batch_docs:
+                await collection.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"benchmarkExecutionID": doc.get("benchmarkExecutionID", str(uuid.uuid4()))}}
+                )
+           
+            await debounced_broadcast(db)
+            logger.info(f"[VALIDATION] Batch marked {len(batch_docs)} records as inprogress")
+           
+            # 3. Process them one by one
+            for i, doc in enumerate(batch_docs):
+                try:
+                    await validate_document_only(db, validator, doc)
+                    if i % 10 == 0:  # Broadcast every 10th record to reduce overhead
+                        await debounced_broadcast(db)
+                except Exception as e:
+                    logger.error(f"[VALIDATION] Single doc error: {e}")
+               
+                await asyncio.sleep(0.5)  # 500ms yield
+           
+            # Force a final broadcast after each batch to ensure cache is up to date
+            await broadcast_summary(db)
+               
         except Exception as e:
             logger.error(f"[VALIDATION PIPELINE] Error: {e}")
             await asyncio.sleep(interval)
-
-async def run_standardization_pipeline(db, validator, collection_name, interval=1, max_concurrent=50):
-    """Pipeline 2: Streaming Standardization with debounced updates."""
-    logger.info(f"[STANDARDIZATION PIPELINE] Started (Streaming, Concurrency: {max_concurrent})")
+ 
+async def run_standardization_pipeline(db, validator, collection_name, interval=1, batch_size=50):
+    """Pipeline 2: Batch-Mark-Then-Process Standardization.
+   
+    Picks up `batch_size` records at once, marks ALL of them as 'standardization inprogress'
+    so the UI can see the full batch, then processes them one by one.
+    """
+    logger.info(f"[STANDARDIZATION PIPELINE] Started (Batch Size: {batch_size})")
     collection = db[collection_name]
-    semaphore = asyncio.Semaphore(max_concurrent)
-    active_tasks = set()
-
+ 
     while True:
         try:
             # Poll for records that are ready for standardization OR previously failed
             query = {"stage": {"$in": ["validation completed", "standardization failed"]}}
-            slots_available = max_concurrent - len(active_tasks)
-            
-            if slots_available > 0:
-                async for doc in collection.find(query).limit(slots_available):
-                    async def _run_task(d):
-                        async with semaphore:
-                            # Mark as In-Progress immediately so UI sees it
-                            await db[collection_name].update_one(
-                                {"_id": d["_id"]},
-                                {"$set": {"stage": "standardization inprogress"}}
-                            )
-                            await standardize_document(db, validator, d)
-                            await debounced_broadcast(db)
-
-                    task = asyncio.create_task(_run_task(doc))
-                    active_tasks.add(task)
-                    task.add_done_callback(active_tasks.discard)
-
-            if len(active_tasks) > 0:
-                await asyncio.sleep(0.1)
-            else:
+           
+            # 1. Pick up a batch of ready records
+            batch_docs = await collection.find(query).limit(batch_size).to_list(batch_size)
+           
+            if not batch_docs:
                 await asyncio.sleep(interval)
+                continue
+           
+            # 2. Mark ALL records in the batch as "standardization inprogress" at once
+            batch_ids = [doc["_id"] for doc in batch_docs]
+            await collection.update_many(
+                {"_id": {"$in": batch_ids}},
+                {"$set": {"stage": "standardization inprogress"}}
+            )
+           
+            await debounced_broadcast(db)
+            logger.info(f"[STANDARDIZATION] Batch marked {len(batch_docs)} records as inprogress")
+           
+            # 3. Process them one by one
+            for i, doc in enumerate(batch_docs):
+                try:
+                    await standardize_document(db, validator, doc)
+                    if i % 10 == 0:  # Broadcast every 10th record to reduce overhead
+                        await debounced_broadcast(db)
+                except Exception as e:
+                    logger.error(f"[STANDARDIZATION] Single doc error: {e}")
+               
+                await asyncio.sleep(0.5)  # 500ms yield
+           
+            # Force a final broadcast after each batch to ensure cache is up to date
+            await broadcast_summary(db)
         except Exception as e:
             logger.error(f"[STANDARDIZATION PIPELINE] Error: {e}")
             await asyncio.sleep(interval)
-
-
+ 
+ 
 # ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
-
+ 
 async def run_trigger():
     """
     Main entry point. Launches both pipelines in parallel.
@@ -459,20 +595,20 @@ async def run_trigger():
     """
     db = get_db()
     collection = db[EXECUTION_INFO_COL]
-
+ 
     # --- STARTUP CLEANUP ---
-    # Any records stuck in 'inprogress' from a previous run should be reset 
+    # Any records stuck in 'inprogress' from a previous run should be reset
     # so the pipelines can pick them up again.
     logger.info("Cleaning up stale 'inprogress' records on startup...")
-    
-    # Validation In-Progress -> Back to initial state (No stage)
+   
+    # Validation In-Progress -> Back to "validation initiated" so the pipeline picks them up again
     val_reset = await collection.update_many(
         {"stage": "validation inprogress"},
-        {"$unset": {"stage": ""}}
+        {"$set": {"stage": "validation initiated"}}
     )
     if val_reset.modified_count > 0:
-        logger.info(f"Reset {val_reset.modified_count} stale validation records.")
-
+        logger.info(f"Reset {val_reset.modified_count} stale validation records to 'validation initiated'.")
+ 
     # Standardization In-Progress -> Back to 'validation completed'
     std_reset = await collection.update_many(
         {"stage": "standardization inprogress"},
@@ -480,21 +616,34 @@ async def run_trigger():
     )
     if std_reset.modified_count > 0:
         logger.info(f"Reset {std_reset.modified_count} stale standardization records.")
-
+ 
+    # Records with NO stage at all (e.g. inserted directly into DB, not via upload API)
+    # -> Set to "validation initiated" so the pipeline picks them up
+    no_stage = await collection.update_many(
+        {"stage": {"$exists": False}},
+        {"$set": {"stage": "validation initiated", "lastModifiedOn": datetime.now(timezone.utc).isoformat()}}
+    )
+    if no_stage.modified_count > 0:
+        logger.info(f"Found {no_stage.modified_count} records with no stage. Set to 'validation initiated'.")
+ 
     logger.info("Initializing Validator...")
     validator = await get_validator()
     logger.info("Validator ready.")
-
+ 
+    # Populate the summary cache immediately so /invalid-summary returns correct counts
+    await broadcast_summary(db)
+    logger.info("Initial summary broadcast complete.")
+ 
     # Try Change Stream first (requires MongoDB Replica Set)
     try:
         logger.info(f"Attempting to start Change Stream on: {EXECUTION_INFO_COL}")
-
+ 
         pipeline = [
             {"$match": {
                 "operationType": {"$in": ["insert", "replace", "update"]}
             }}
         ]
-
+ 
         # For Change Stream mode, we still run both pipelines in parallel
         # Change Stream handles real-time validation; standardization pipeline picks up after
         async def _change_stream_validation():
@@ -505,45 +654,45 @@ async def run_trigger():
                     op_type = change["operationType"]
                     doc = change.get("fullDocument")
                     if not doc: continue
-
+ 
                     doc_id = doc.get("_id")
-
+ 
                     # --- AUTO-RESET LOGIC ---
                     # If an existing record is updated with NEW DATA, we must re-trigger validation.
                     if op_type == "update":
                         updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
                         # Check if any of the updated fields are "Real Data" (not internal statuses)
                         real_data_changed = any(f for f in updated_fields if f not in INTERNAL_FIELDS)
-                        
+                       
                         if real_data_changed:
-                            logger.info(f"[TRIGGER] Data change detected for {doc_id}. Resetting stage to re-trigger pipeline...")
+                            logger.info(f"[TRIGGER] Data change detected for {doc_id}. Resetting stage to 'validation initiated'...")
                             await collection.update_one(
                                 {"_id": doc_id},
-                                {"$unset": {"stage": "", "isValid": "", "invalidFields": "", "invalidPayload": "", "fieldStatus": ""}}
+                                {"$set": {"stage": "validation initiated"}, "$unset": {"isValid": "", "invalidFields": "", "invalidPayload": "", "fieldStatus": ""}}
                             )
                             # The polling loop will pick it up in the next cycle
                             continue
-
+ 
                     # --- START PROCESSING LOGIC ---
-                    # Only start processing if the record doesn't have a stage yet
-                    if "stage" not in doc:
+                    # Only start processing if the record is in 'validation initiated' state
+                    if doc.get("stage") == "validation initiated":
                         count += 1
                         logger.info(f"[CHANGE STREAM] Processing Record #{count} ({doc_id})")
                         await validate_document(db, validator, doc)
-
+ 
         # Run Change Stream validation + Standardization pipeline in parallel
         logger.info("Starting dual pipelines: Change Stream (Validation) + Polling (Standardization)...")
         await asyncio.gather(
             _change_stream_validation(),
             run_standardization_pipeline(db, validator, EXECUTION_INFO_COL)
         )
-
+ 
     except (OperationFailure, PyMongoError) as e:
         err_msg = str(e)
         if isinstance(e, OperationFailure) and e.code == 40573 or "not support change streams" in err_msg.lower():
             logger.warning("Change Streams not supported (Standalone MongoDB). Switching to Polling Mode.")
             logger.info("Starting dual pipelines: Validation + Standardization (both polling)...")
-
+ 
             # Run BOTH pipelines in parallel
             await asyncio.gather(
                 run_validation_pipeline(db, validator, EXECUTION_INFO_COL),
@@ -554,13 +703,13 @@ async def run_trigger():
             logger.info("Restarting trigger in 5 seconds...")
             await asyncio.sleep(5)
             await run_trigger()
-
+ 
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         await asyncio.sleep(5)
         await run_trigger()
-
-
+ 
+ 
 if __name__ == "__main__":
     try:
         asyncio.run(run_trigger())
@@ -568,3 +717,4 @@ if __name__ == "__main__":
         logger.info("Trigger stopped by user.")
     finally:
         close_db()
+        

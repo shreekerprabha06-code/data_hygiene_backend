@@ -9,34 +9,34 @@ import collections
 
 async def main():
     db = get_db()
-   
+
     print("Fetching dynamic validation rules from masterlist_db...")
     validator = await get_validator()
     mappings = await build_mappings()
-   
+
     print(f"Discovered {len(mappings)} validation parameters: {list(mappings.keys())}")
-   
+
     # Process ALL records every time the script is run
     cursor = db[EXECUTION_INFO_COL].find({}).sort("_id", 1)
-   
+
     print("Starting offline validation batch processing using advanced cross-field relations...")
     print("Status preservation is now real-time to avoid race conditions.")
-   
+
     batch_size = 2000
     updates = []
     snapshot_items = []
     processed = 0
-   
+
     total_valid = 0
     total_invalid = 0
-   
+
     async for doc in cursor:
         invalid_payload, field_status = await validator.validate_doc(db, doc)
         is_val = len(invalid_payload) == 0
         exec_id = doc.get("benchmarkExecutionID")
         if not exec_id:
             exec_id = str(uuid.uuid4())
-        
+
         # 1. Update Executioninfo basic status
         updates.append(UpdateOne(
             {"_id": doc["_id"]},
@@ -52,30 +52,30 @@ async def main():
                     "lastModifiedOn": datetime.now(timezone.utc).isoformat()
                 },
                 "$unset": {
-                    "validated": "", 
+                    "validated": "",
                     "standardized": "",
                     "fieldStatus": "",
                     "invalidPayload": ""
                 }
             }
         ))
-        
+
         if is_val:
             total_valid += 1
         else:
             total_invalid += 1
-            
+
         # 2. Handle Snapshot Logic (Transition or Update)
         latest_snap = await db[SNAPSHOT_COL].find_one(
             {"execution_id": exec_id},
             {"data": {"$slice": 1}, "snapshot_id": 1}
         )
-        
+
         if is_val:
             # Record is VALID - Only update if a snapshot ALREADY exists (History Preservation)
             if latest_snap and latest_snap.get("data"):
                 prev_data = latest_snap["data"][0]
-                
+
                 # If it's already ACCEPTED, REJECTED, or ON HOLD, don't revert it
                 current_status = str(prev_data.get("standardization_status", "")).upper()
                 if current_status not in ["ACCEPTED", "REJECTED", "ON HOLD"]:
@@ -95,16 +95,16 @@ async def main():
                 snap_id = latest_snap.get("snapshot_id", snap_id)
                 if latest_snap.get("data"):
                     prev_data = latest_snap["data"][0]
-            
+
             # Normalize status to uppercase, defaults to PENDING
             raw_status = prev_data.get("standardization_status", "PENDING")
             status_val = raw_status.upper() if raw_status else "PENDING"
-            
+
             clean_meta = []
             for p in invalid_payload:
                 field = p.get("field")
                 val = p.get("value")
-                
+
                 p_clean = {
                     "field": field,
                     "currentStatus": "invalid",
@@ -114,10 +114,10 @@ async def main():
                     "mapping": p.get("mapping", "")
                 }
                 actual_meta_vals = {m["name"]: m.get("value", "") for m in p.get("metadata", []) if m.get("name")}
-                
+
                 # Get record-level suggestions using the new 'Mega-String' logic
                 record_suggestions = validator.get_record_level_suggestions(field, val, actual_meta_vals)
-                
+
                 # Build formatted suggestions for the dashboard (Suggestion Status = PENDING initially)
                 primary_comparing = []
                 for i, rec_sug in enumerate(record_suggestions, 1):
@@ -128,7 +128,7 @@ async def main():
                         "_id": rec_sug["_id"]
                     })
                 p_clean["comparingData"] = primary_comparing
-                
+
                 meta_list = []
                 for m in p.get("metadata", []):
                     m_clean = dict(m)
@@ -146,7 +146,7 @@ async def main():
                     meta_list.append(m_clean)
                 p_clean["metadata"] = meta_list
                 clean_meta.append(p_clean)
-            
+
             snapshot_doc = {
                 "snapshot_id": snap_id,
                 "execution_id": exec_id,
@@ -166,13 +166,13 @@ async def main():
                     })
                 }]
             }
-            
+
             snapshot_items.append(ReplaceOne(
                 {"execution_id": exec_id},
                 snapshot_doc,
                 upsert=True
             ))
-       
+
         if len(updates) >= batch_size:
             await db[EXECUTION_INFO_COL].bulk_write(updates, ordered=False)
             if snapshot_items:
@@ -181,17 +181,16 @@ async def main():
             processed += len(updates)
             print(f"Processed {processed} records... (Valid: {total_valid}, Invalid: {total_invalid})")
             updates.clear()
-           
+
     if updates:
         await db[EXECUTION_INFO_COL].bulk_write(updates, ordered=False)
         processed += len(updates)
     if snapshot_items:
         await db[SNAPSHOT_COL].bulk_write(snapshot_items, ordered=False)
-               
+
     print(f"\nOffline Validation Complete! Total: {processed}")
     close_db()
- 
- 
+
+
 if __name__ == "__main__":
     asyncio.run(main())
-    

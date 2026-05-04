@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Query, Body, HTTPException, File, UploadFile
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Dict, Any, Optional
 import time
 import json
@@ -8,6 +8,7 @@ from rapidfuzz import process
 from datetime import datetime, timedelta
 import uuid
 import os
+import asyncio
 from database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from validation import build_mappings, get_validator
 from utils import get_nested_value, get_metadata_schema
@@ -43,17 +44,51 @@ def _set_nested_key(doc: Dict[str, Any], path: str, value: Any):
 
 
 class ApproveSuggestionRequest(BaseModel):
-    model_config = ConfigDict(extra='allow')
-
+    model_config = ConfigDict(
+        extra='allow',
+        json_schema_extra={
+            "example": {
+                "execution_id": "uuid-12345",
+                "field_name": "CPUModel",
+                "accepted_value": "9575F",
+                "currentStatus": "Accepted",
+                "coreCount": "128",
+                "masterlist_id": "67b97e9de296d92efb1bd7e4",
+                "metadata": {
+                    "Architecture": "x86-64",
+                    "CCDCount": "16",
+                    "CPU(s)": "128",
+                    "CPUMaxMHz": "3700",
+                    "Core(s)PerSocket": "64",
+                    "CorePerCCD": "8",
+                    "Family": "Turin",
+                    "L3Cache": "512 MB",
+                    "L3CacheInstances": "16",
+                    "Microarchitecture": "Zen 5",
+                    "Microcode": "0x1000000",
+                    "Model": "9575F",
+                    "PeakPerformance": "High",
+                    "Socket(s)": "1",
+                    "Technology": "4nm",
+                    "Thread(s)PerCore": "2",
+                    "num_L3": "16",
+                    "cloudProvider": "AWS",
+                    "BenchmarkType": "Nginx",
+                    "BenchmarkCategory": "Web",
+                    "sutType": "Server"
+                }
+            }
+        }
+    )
+ 
     execution_id: str
     field_name: str
     accepted_value: str
     currentStatus: str = "Accepted"
     coreCount: Optional[str] = None
-
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 class BatchExecutionRequest(BaseModel):
     execution_ids: List[str]
-    stage: Optional[str] = None
 
 class RejectRecordRequest(BaseModel):
     execution_id: str
@@ -137,7 +172,9 @@ async def broadcast_summary(db):
 
     # Map to UI Groupings
     grouped_stages = {
+        "VALIDATION_INITIATED": raw_stages.get("validation initiated", 0),
         "VALIDATION_IN_PROGRESS": (
+            raw_stages.get("validation initiated", 0) +
             raw_stages.get("validation inprogress", 0) + 
             raw_stages.get("validation failed", 0)
         ),
@@ -148,6 +185,7 @@ async def broadcast_summary(db):
         ),
         "STANDARDIZATION_COMPLETED": raw_stages.get("standardization completed", 0),
         "TOTAL_INVALID_RECORDS": (
+            raw_stages.get("validation initiated", 0) +
             raw_stages.get("validation inprogress", 0) + 
             raw_stages.get("validation completed", 0) + 
             raw_stages.get("validation failed", 0) +
@@ -364,21 +402,16 @@ async def get_dynamic_draft_fields(type_name: str) -> Dict[str, Any]:
 async def get_dynamic_age_counts(db, base_query: Dict[str, Any]):
     """
     Calculates the distribution of records across age buckets (Green, Yellow, Red)
-    within the context of the provided base_query.
+    using the ExecutionInfo collection's lastModifiedOn field for consistency.
     """
     counts = {"red": 0, "yellow": 0, "green": 0}
     now = datetime.utcnow()
     
-    # We must project the updatedOn from the history array for the age calculation
     count_agg = [
-        {"$match": base_query},
-        {"$addFields": {
-            "updatedOn": {"$arrayElemAt": ["$data.history.updatedOn", 0]}
-        }},
-        {"$match": {"updatedOn": {"$type": "string"}}},
+        {"$match": {**base_query, "lastModifiedOn": {"$type": "string"}}},
         {"$addFields": {
             "now": now,
-            "dt": {"$dateFromString": {"dateString": "$updatedOn", "onError": None}}
+            "dt": {"$dateFromString": {"dateString": "$lastModifiedOn", "onError": None}}
         }},
         {"$match": {"dt": {"$ne": None}}},
         {"$addFields": {
@@ -399,7 +432,7 @@ async def get_dynamic_age_counts(db, base_query: Dict[str, Any]):
         }}
     ]
 
-    async for result_doc in db[SNAPSHOT_COL].aggregate(count_agg):
+    async for result_doc in db[EXECUTION_INFO_COL].aggregate(count_agg):
         if result_doc["_id"] in counts:
             counts[result_doc["_id"]] = result_doc["count"]
     
@@ -453,27 +486,60 @@ async def get_invalid_summary(
                
             search_query["$or"] = or_filters
 
-    # 4. Business Status Filter (Requires Snapshot join)
-    status_filter_post = {}
+    # 4. Business Status Pre-Fetch Filter (Replaces heavy $lookup)
+    status_condition = {}
     if status:
         status_list = [s.strip().upper() for s in status.split(",")]
-        if len(status_list) > 1:
-            status_filter_post = {"snapshot.data.0.standardization_status": {"$in": status_list}}
+        other_statuses = [s for s in status_list if s not in ["PENDING", "N/A"]]
+        
+        snapshot_query = {}
+        if other_statuses and "PENDING" in status_list:
+            snapshot_query = {"$or": [
+                {"data.0.standardization_status": {"$in": other_statuses}},
+                {"data.0.standardization_status": "PENDING"},
+                {"data.0.standardization_status": {"$exists": False}}
+            ]}
+        elif other_statuses:
+            snapshot_query = {"data.0.standardization_status": {"$in": other_statuses}}
+        elif "PENDING" in status_list:
+             snapshot_query = {"$or": [
+                {"data.0.standardization_status": "PENDING"},
+                {"data.0.standardization_status": {"$exists": False}}
+            ]}
+            
+        status_exec_ids = []
+        if snapshot_query:
+            # Quick collection scan/index scan to extract just the IDs (milliseconds instead of seconds)
+            cursor = db[SNAPSHOT_COL].find(snapshot_query, {"execution_id": 1})
+            status_exec_ids = [doc["execution_id"] for doc in await cursor.to_list(None)]
+            
+        or_conditions = []
+        if "N/A" in status_list:
+            # N/A covers any stage that isn't finished
+            or_conditions.append({"stage": {"$ne": "standardization completed"}})
+            
+        if status_exec_ids:
+            # PENDING and other statuses are resolved via snapshot execution IDs
+            or_conditions.append({"benchmarkExecutionID": {"$in": status_exec_ids}, "stage": "standardization completed"})
+            
+        if len(or_conditions) > 1:
+            status_condition = {"$or": or_conditions}
+        elif len(or_conditions) == 1:
+            status_condition = or_conditions[0]
         else:
-            status_filter_post = {"snapshot.data.0.standardization_status": status_list[0]}
+            # If they queried PENDING or other statuses but 0 IDs were found, force a mismatch
+            status_condition = {"_id": "force_empty_result_status_not_found"}
 
-    # 5. Age Filter (Requires Snapshot join or lastModifiedOn)
-    age_filter_post = {}
     if age:
         now = datetime.utcnow()
         green_threshold = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         yellow_threshold = (now - timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         if age.lower() == "green":
-            age_filter_post = {"lastModifiedOn": {"$gte": green_threshold}}
+            search_query["lastModifiedOn"] = {"$gte": green_threshold}
         elif age.lower() == "yellow":
-            age_filter_post = {"lastModifiedOn": {"$lt": green_threshold, "$gte": yellow_threshold}}
+            search_query["lastModifiedOn"] = {"$lt": green_threshold, "$gte": yellow_threshold}
         elif age.lower() == "red":
-            age_filter_post = {"lastModifiedOn": {"$lt": yellow_threshold}}
+            search_query["lastModifiedOn"] = {"$lt": yellow_threshold}
 
     # 6. Final Match Query (Include Invalid, In-Progress, and Accepted records for visibility)
     # We now show everything that has at least reached the validation stage
@@ -486,170 +552,192 @@ async def get_invalid_summary(
         # Merge search filters into the match_query
         match_query.update(search_query)
         
+    stage_condition = {}
     if stage:
         # Normalize: lower case, replace hyphens and underscores with spaces, and handle 'inprogress' vs 'in progress'
         stage_list = [s.strip().lower().replace("_", " ").replace("-", " ").replace("in progress", "inprogress") for s in stage.split(",")]
-        # Mapping: Standardization In-Progress should also include records waiting in 'validation completed'
+        
+        # UI mapping fix: include failed queues and initiated in the 'inprogress' groups
+        if "validation inprogress" in stage_list:
+            if "validation failed" not in stage_list:
+                stage_list.append("validation failed")
+            if "validation initiated" not in stage_list:
+                stage_list.append("validation initiated")
+            
         if "standardization inprogress" in stage_list:
-            stage_list.append("validation completed")
+            if "standardization failed" not in stage_list:
+                stage_list.append("standardization failed")
+            if "validation completed" not in stage_list:
+                stage_list.append("validation completed")
             
         if len(stage_list) > 1:
-            match_query["stage"] = {"$in": stage_list}
+            stage_condition = {"stage": {"$in": stage_list}}
         else:
-            match_query["stage"] = stage_list[0]
-    
+            stage_condition = {"stage": stage_list[0]}
+            
+    # Combine everything into the final match query BEFORE lookup
+    # Stage + Status use $or (union) because they target mutually exclusive stage values
+    # Search uses $and (intersection) to narrow results
+    if stage_condition and status_condition:
+        # Union: show records matching EITHER the stage OR the status
+        combined = {"$or": [stage_condition, status_condition]}
+        match_query = {"$and": [match_query, combined]}
+    elif stage_condition:
+        match_query = {"$and": [match_query, stage_condition]}
+    elif status_condition:
+        match_query = {"$and": [match_query, status_condition]}
+    # else match_query stays as-is
+        
     print(f"API Executing Final Match Query: {match_query}")
 
     skip_count = (page - 1) * size
     
     # 2. Extract Data (Use ExecutionInfo as base for pipeline visibility)
-    invalid_records = []
-    pipeline = [
+    # Optimized: $lookup only fetches the fields we need from snapshot
+    data_pipeline = [
         {"$match": match_query},
+        # Priority sort: active pipeline records on top, then by recency
+        {"$addFields": {
+            "_sortPriority": {
+                "$switch": {
+                    "branches": [
+                        {"case": {"$eq": ["$stage", "validation initiated"]}, "then": 0},
+                        {"case": {"$eq": ["$stage", "validation inprogress"]}, "then": 1},
+                        {"case": {"$eq": ["$stage", "standardization inprogress"]}, "then": 2},
+                        {"case": {"$eq": ["$stage", "validation completed"]}, "then": 3}
+                    ],
+                    "default": 4
+                }
+            }
+        }},
+        {"$sort": {"_sortPriority": 1, "lastModifiedOn": -1}},
+        {"$skip": skip_count},
+        {"$limit": size},
         {"$lookup": {
             "from": SNAPSHOT_COL,
             "localField": "benchmarkExecutionID",
             "foreignField": "execution_id",
+            "pipeline": [{"$project": {
+                "data.standardization_status": 1,
+                "data.invalidValues.field": 1,
+                "data.invalidValues.comparingData": 1,
+                "data.invalidValues.validation_status": 1,
+                "data.invalidValues.metadata.name": 1,
+                "data.invalidValues.metadata.validation_status": 1,
+                "data.invalidValues.metadata.comparingData": 1
+            }}],
             "as": "snapshot"
         }},
         {"$unwind": {"path": "$snapshot", "preserveNullAndEmptyArrays": True}}
     ]
-
-    # Apply Business Status and Age filters AFTER the join
-    if status_filter_post:
-        pipeline.append({"$match": status_filter_post})
-    if age_filter_post:
-        pipeline.append({"$match": age_filter_post})
-
-    # Add sorting, pagination
-    pipeline.extend([
-        {"$sort": {"lastModifiedOn": -1}},
-        {"$skip": skip_count},
-        {"$limit": size}
-    ])
     
-    cursor = db[EXECUTION_INFO_COL].aggregate(pipeline)
-    
-    # Pre-fetch validator for suggestions check
-    validator = await get_validator()
-    
-    async for doc in cursor:
-        snapshot = doc.get("snapshot") or {}
-        snapshot_data = (snapshot.get("data") or [{}])[0]
-        
-        # Collect invalid fields: Prefer ExecutionInfo cache, fallback to Snapshot data
-        invalid_fields = doc.get("invalidFields")
-        if not invalid_fields and snapshot_data.get("invalidValues"):
-            # If the summary list is missing, build it from the raw snapshot values
-            invalid_fields = sorted(list(set(
-                [p.get("field") for p in snapshot_data.get("invalidValues", []) if p.get("validation_status") == "invalid"] +
-                [m.get("name") for p in snapshot_data.get("invalidValues", []) for m in p.get("metadata", []) if m.get("validation_status") == "invalid"]
-            )))
-        
-        if not invalid_fields:
+    # 3. Run data fetch and count in parallel for speed
+    # Run ALL queries in parallel for maximum speed
+    async def _fetch_data():
+        records = []
+        async for doc in db[EXECUTION_INFO_COL].aggregate(data_pipeline):
+            snapshot = doc.get("snapshot") or {}
+            snapshot_data = (snapshot.get("data") or [{}])[0]
+            
             invalid_fields = []
-            
-        record = {
-            "ExecutionId": doc.get("benchmarkExecutionID"),
-            "Status": snapshot_data.get("standardization_status", "N/A"),
-            "Stage": doc.get("stage", "validation inprogress"),
-            "BenchmarkType": doc.get("benchmarkType", "N/A"),
-            "BenchmarkCategory": doc.get("benchmarkCategory", "N/A"),
-            "InvalidFields": invalid_fields,
-            "suggestionsCount": bool(snapshot_data.get("invalidValues")), # Suggestions come from snapshot
-            "updatedOn": doc.get("lastModifiedOn")
-        }
-            
-        invalid_records.append(record)
+            if snapshot_data.get("invalidValues"):
+                invalid_fields = sorted(list(set(
+                    [p.get("field") for p in snapshot_data.get("invalidValues", []) if p.get("validation_status") == "invalid"] +
+                    [m.get("name") for p in snapshot_data.get("invalidValues", []) for m in p.get("metadata", []) if m.get("validation_status") == "invalid"]
+                )))
+            else:
+                invalid_fields = doc.get("invalidFields") or []
+                
+            doc_stage = str(doc.get("stage", "validation inprogress")).lower()
+            if doc_stage == "standardization completed":
+                status_val = snapshot_data.get("standardization_status", "PENDING")
+            else:
+                status_val = "N/A"
+                
+            records.append({
+                "ExecutionId": doc.get("benchmarkExecutionID"),
+                "Status": status_val,
+                "Stage": doc.get("stage", "validation inprogress"),
+                "BenchmarkType": doc.get("benchmarkType", "N/A"),
+                "BenchmarkCategory": doc.get("benchmarkCategory", "N/A"),
+                "InvalidFields": invalid_fields,
+                "suggestionsCount": any(
+                    len(p.get("comparingData", [])) > 0 or 
+                    any(len(m.get("comparingData", [])) > 0 for m in p.get("metadata", []))
+                    for p in snapshot_data.get("invalidValues", [])
+                ),
+                "updatedOn": doc.get("lastModifiedOn")
+            })
+        return records
 
-    # 3. Total Count Logic
-    if search or status or stage or age:
-        count_pipeline = [{"$match": match_query}]
-        if status_filter_post or age_filter_post:
-            count_pipeline.append({"$lookup": {
-                "from": SNAPSHOT_COL,
-                "localField": "benchmarkExecutionID",
-                "foreignField": "execution_id",
-                "as": "snapshot"
-            }})
-            count_pipeline.append({"$unwind": {"path": "$snapshot", "preserveNullAndEmptyArrays": True}})
-            if status_filter_post: count_pipeline.append({"$match": status_filter_post})
-            if age_filter_post: count_pipeline.append({"$match": age_filter_post})
-        
-        count_pipeline.append({"$count": "total"})
-        count_result = await db[EXECUTION_INFO_COL].aggregate(count_pipeline).to_list(1)
-        total_records = count_result[0]["total"] if count_result else 0
-    else:
-        total_records = await db[EXECUTION_INFO_COL].count_documents(match_query)
+    async def _fetch_count():
+        if search or status or stage or age:
+            count_pipeline = [{"$match": match_query}, {"$count": "total"}]
+            count_result = await db[EXECUTION_INFO_COL].aggregate(count_pipeline).to_list(1)
+            return count_result[0]["total"] if count_result else 0
+        else:
+            return await db[EXECUTION_INFO_COL].count_documents(match_query)
 
-    try:
-        # 4. Generate Dynamically Filtered Summary
-        # A. Age Counts
-        snap_search_query = {}
-        if search:
+    async def _fetch_age_counts():
+        if not search_query:
+            import trigger
+            _cached = trigger._LAST_SUMMARY
+            return {"red": _cached.get("red", 0), "yellow": _cached.get("yellow", 0), "green": _cached.get("green", 0)}
+        else:
+            age_search_query = {}
             is_uuid = len(search) == 36 and search.count("-") == 4
-            if is_uuid: snap_search_query["execution_id"] = search
-            else: snap_search_query["execution_id"] = {"$regex": search, "$options": "i"}
+            if is_uuid: age_search_query["benchmarkExecutionID"] = search
+            else: age_search_query["benchmarkExecutionID"] = {"$regex": search, "$options": "i"}
+            return await get_dynamic_age_counts(db, age_search_query)
 
-        age_count_match = {**snap_search_query}
-        summary_counts = await get_dynamic_age_counts(db, age_count_match)
-
-        # B. Status & Stage Counts (Optimized Parallel Aggregation)
-        # IMPORTANT: We use ONLY the search_query here, NOT the full match_query.
-        # This ensures counts in the dropdown don't change when a filter is applied.
-        status_agg_pipe = [
-            {"$match": search_query or {"stage": {"$exists": True}}},
-            {"$lookup": {
-                "from": SNAPSHOT_COL,
-                "localField": "benchmarkExecutionID",
-                "foreignField": "execution_id",
-                "as": "snapshot"
-            }},
-            {"$unwind": {"path": "$snapshot", "preserveNullAndEmptyArrays": True}},
-            {"$facet": {
-                "statuses": [
-                    {"$project": {
-                        "status": {
-                            "$cond": {
-                                "if": {"$and": [{"$isArray": "$snapshot.data"}, {"$gt": [{"$size": "$snapshot.data"}, 0]}]},
-                                "then": {"$arrayElemAt": ["$snapshot.data.standardization_status", 0]},
-                                "else": "N/A"
-                            }
-                        }
-                    }},
-                    {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-                ],
-                "stages": [
-                    {"$group": {"_id": "$stage", "count": {"$sum": 1}}}
-                ]
-            }}
-        ]
-
-        agg_results = await db[EXECUTION_INFO_COL].aggregate(status_agg_pipe).to_list(1)
-        facet_res = agg_results[0] if agg_results else {"statuses": [], "stages": []}
-
-        # Parse Status Counts
-        status_counts = {"PENDING": 0, "REJECTED": 0, "ACCEPTED": 0, "ON HOLD": 0, "N/A": 0}
-        for s in facet_res["statuses"]:
-            key = str(s["_id"] or "N/A").upper()
-            if key in status_counts: status_counts[key] = s["count"]
-            else: status_counts["N/A"] += s["count"]
-
-        # Parse Stage Counts
-        raw_stages = {str(s["_id"] or "unknown").lower(): s["count"] for s in facet_res["stages"]}
-        grouped_stages = {
+    async def _fetch_stage_counts():
+        stage_agg = await db[EXECUTION_INFO_COL].aggregate([
+            {"$match": {"stage": {"$exists": True}}},
+            {"$group": {"_id": "$stage", "count": {"$sum": 1}}}
+        ]).to_list(20)
+        raw_stages = {str(s["_id"] or "unknown").lower(): s["count"] for s in stage_agg}
+        return {
+            "VALIDATION_INITIATED": raw_stages.get("validation initiated", 0),
             "VALIDATION_IN_PROGRESS": (
-                raw_stages.get("validation inprogress", 0) + 
+                raw_stages.get("validation inprogress", 0) +
                 raw_stages.get("validation failed", 0)
             ),
+            "VALIDATION_COMPLETED": raw_stages.get("validation completed", 0),
             "STANDARDIZATION_IN_PROGRESS": (
-                raw_stages.get("standardization inprogress", 0) + 
-                raw_stages.get("validation completed", 0) + 
+                raw_stages.get("standardization inprogress", 0) +
                 raw_stages.get("standardization failed", 0)
             ),
-            "STANDARDIZATION_COMPLETED": raw_stages.get("standardization completed", 0)
+            "STANDARDIZATION_COMPLETED": raw_stages.get("standardization completed", 0),
         }
 
+
+    async def _fetch_status_counts():
+        # Query Snapshot collection DIRECTLY - no expensive $lookup needed
+        status_results = await db[SNAPSHOT_COL].aggregate([
+            {"$project": {
+                "status": {
+                    "$cond": {
+                        "if": {"$and": [{"$isArray": "$data"}, {"$gt": [{"$size": "$data"}, 0]}]},
+                        "then": {"$arrayElemAt": ["$data.standardization_status", 0]},
+                        "else": "PENDING"
+                    }
+                }
+            }},
+            {"$group": {"_id": "$status", "count": {"$sum": 1}}}
+        ]).to_list(20)
+        counts = {"PENDING": 0, "REJECTED": 0, "ACCEPTED": 0, "ON HOLD": 0, "N/A": 0}
+        for s in status_results:
+            key = str(s["_id"] or "N/A").upper()
+            if key in counts: counts[key] = s["count"]
+            else: counts["N/A"] += s["count"]
+        return counts
+
+    # Execute ALL 5 queries in parallel
+    invalid_records, total_records, summary_counts, grouped_stages, status_counts = await asyncio.gather(
+        _fetch_data(), _fetch_count(), _fetch_age_counts(), _fetch_stage_counts(), _fetch_status_counts()
+    )
+
+    try:
         return {
             "status": "success",
             "total_invalid_records": total_records,
@@ -683,13 +771,11 @@ async def get_summary_poll():
 @router.post("/invalid-summary/batch")
 async def get_invalid_summary_batch(request: BatchExecutionRequest):
     """
-    Returns summarized statistics for a batch of execution IDs, 
-    optionally filtered by stage.
+    Returns summarized statistics for a batch of execution IDs.
     """
     try:
         db = get_db()
         execution_ids = request.execution_ids
-        stage_filter = request.stage
         
         if not execution_ids:
             return {
@@ -702,41 +788,56 @@ async def get_invalid_summary_batch(request: BatchExecutionRequest):
         # 1. Base Match
         match_query = {"benchmarkExecutionID": {"$in": execution_ids}}
         
-        # 2. Apply Stage Filter (Supports comma-separated values)
-        if stage_filter:
-            stages = [s.strip().lower() for s in stage_filter.split(",")]
-            match_query["stage"] = {"$in": stages}
-        
         # 3. Aggregation Pipeline
         pipeline = [
             {"$match": match_query},
+            # Deduplicate by benchmarkExecutionID picking the latest record
+            {"$sort": {"lastModifiedOn": -1}},
+            {"$group": {
+                "_id": "$benchmarkExecutionID",
+                "doc": {"$first": "$$ROOT"}
+            }},
+            {"$replaceRoot": {"newRoot": "$doc"}},
             {"$lookup": {
                 "from": SNAPSHOT_COL,
                 "localField": "benchmarkExecutionID",
                 "foreignField": "execution_id",
                 "as": "snapshot"
             }},
-            {"$unwind": {"path": "$snapshot", "preserveNullAndEmptyArrays": True}},
-            {"$sort": {"lastModifiedOn": -1}}
+            {"$unwind": {"path": "$snapshot", "preserveNullAndEmptyArrays": True}}
         ]
 
         cursor = db[EXECUTION_INFO_COL].aggregate(pipeline)
         
         invalid_records = []
         async for doc in cursor:
+            # Yield control so background processes are not starved!
+            await asyncio.sleep(0)
+            
             snapshot = doc.get("snapshot") or {}
             snapshot_data = (snapshot.get("data") or [{}])[0]
             
-            invalid_fields = doc.get("invalidFields")
-            if not invalid_fields and snapshot_data.get("invalidValues"):
+            # Always derive invalid fields from the snapshot to ensure metadata fields are included
+            invalid_fields = []
+            if snapshot_data.get("invalidValues"):
                 invalid_fields = sorted(list(set(
                     [p.get("field") for p in snapshot_data.get("invalidValues", []) if p.get("validation_status") == "invalid"] +
                     [m.get("name") for p in snapshot_data.get("invalidValues", []) for m in p.get("metadata", []) if m.get("validation_status") == "invalid"]
                 )))
+            else:
+                # Fallback to ExecutionInfo cache if snapshot is missing
+                invalid_fields = doc.get("invalidFields") or []
             
+            # Calculate Status based on Stage
+            stage = str(doc.get("stage", "validation inprogress")).lower()
+            if stage == "standardization completed":
+                status_val = snapshot_data.get("standardization_status", "PENDING")
+            else:
+                status_val = "N/A"
+
             record = {
                 "ExecutionId": doc.get("benchmarkExecutionID"),
-                "Status": snapshot_data.get("standardization_status", "N/A"),
+                "Status": status_val,
                 "Stage": doc.get("stage", "validation inprogress"),
                 "BenchmarkType": doc.get("benchmarkType", "N/A"),
                 "BenchmarkCategory": doc.get("benchmarkCategory", "N/A"),
@@ -1074,31 +1175,42 @@ async def get_snapshot_records(Execution_id: str):
                 "validation_status": support.get("validation_status")
             })
             
-        # 2. Build suggestions for this field (grouped by masterlist record)
-        actual_meta_vals = {s.get("name"): s.get("value", "") for s in meta.get("metadata", []) if s.get("name")}
-        record_suggestions = validator.get_record_level_suggestions(field_name, val, actual_meta_vals)
-        
+        # 2. Build suggestions for this field directly from the snapshot
         saved_comparing = meta.get("comparingData", [])
-        
         field_suggestions = []
-        for rec_sug in record_suggestions:
-            sug_val = rec_sug["primary_value"]
-            saved_status = "PENDING"
+        
+        for saved_sug in saved_comparing:
+            sug_key = next((k for k in saved_sug if k.startswith("suggestion")), None)
+            score_key = next((k for k in saved_sug if k.startswith("score")), None)
+            sug_val = saved_sug.get(sug_key) if sug_key else None
+            score_val = saved_sug.get(score_key, 0) if score_key else 0
             
-            # Find the saved status for this suggestion from the DB
-            for saved_sug in saved_comparing:
-                match_val = next((v for k, v in saved_sug.items() if k.startswith("suggestion")), None)
-                if match_val == sug_val:
-                    saved_status = saved_sug.get("status", "PENDING")
-                    break
-
             sug_entry = {
                 field_name.lower(): sug_val,
-                "score": rec_sug.get("score", 0),
-                "status": saved_status
+                "score": score_val,
+                "status": saved_sug.get("status", "PENDING"),
+                "_id": saved_sug.get("_id")
             }
-            for m_name, m_val in rec_sug["metadata"].items():
+            
+            # Extract metadata for this specific suggestion
+            for support in meta.get("metadata", []):
+                m_name = support.get("name")
+                if not m_name: continue
+                
+                m_comparing = support.get("comparingData", [])
+                m_val = "None"
+                # Find the matching suggestion for this metadata field by _id or suggestion key
+                for m_sug in m_comparing:
+                    if saved_sug.get("_id") and m_sug.get("_id") == saved_sug.get("_id"):
+                        m_val_key = next((k for k in m_sug if k.startswith("suggestion")), None)
+                        if m_val_key: m_val = m_sug.get(m_val_key)
+                        break
+                    elif sug_key and sug_key in m_sug:
+                        m_val = m_sug.get(sug_key)
+                        break
+                
                 sug_entry[m_name.lower()] = m_val
+                
             field_suggestions.append(sug_entry)
             
         # 3. Add Draft Record if available for this specific field type
@@ -1224,7 +1336,6 @@ async def get_snapshot_records(Execution_id: str):
             "createdOn":         created_on,
             "tester":            exec_meta.get("tester"),
             "resultType":        exec_meta.get("resultType"),
-            "stage":             exec_meta.get("stage", "validation inprogress"),
         },
         "data": data_list,
         "standardization_status": item.get("standardization_status", "PENDING"),
@@ -1425,25 +1536,488 @@ async def resolve_fuzzy_benchmarks(benchmarkType: Optional[str] = None, benchmar
     return resolved
 
 
+# @router.put("/approve-suggestion")
+# async def approve_suggestion(req: ApproveSuggestionRequest):
+#     try:
+#         db = get_db()
+   
+#         # 1. Fetch Snapshot
+#         snap = await db[SNAPSHOT_COL].find_one({"execution_id": req.execution_id})
+#         if not snap or not snap.get("data"):
+#             return {"status": "error", "message": f"Snapshot not found for Execution ID: {req.execution_id}"}
+       
+#         snap_data = snap["data"][0]
+#         invalid_values = snap_data.get("invalidValues", [])
+       
+#         # 2. Identify the selected field and suggestion (supporting nested metadata)
+#         target_item = None
+#         target_mapping = None
+#         original_value = None
+#         suggestion_found = False
+       
+#         # Check top-level invalid fields first
+#         for item in invalid_values:
+#             if item.get("field") == req.field_name:
+#                 target_item = item
+#                 original_value = item.get("value")
+#                 # Fetch primary mapping
+#                 m_info = await get_masterlist_mappings(req.field_name)
+#                 target_mapping = m_info.get("mapping")
+#                 break
+           
+#             # Check nested metadata fields
+#             for meta_item in item.get("metadata", []):
+#                 if meta_item.get("name") == req.field_name:
+#                     target_item = meta_item
+#                     original_value = meta_item.get("value")
+#                     # Fetch metadata-specific mapping
+#                     m_info = await get_masterlist_mappings(item.get("field"))
+#                     target_mapping = m_info.get("metadata_mappings", {}).get(req.field_name)
+#                     break
+#             if target_item: break
+   
+#         if not target_item:
+#             return {"status": "error", "message": f"Field '{req.field_name}' not found in snapshot."}
+           
+#         # 3. Update suggestion statuses
+#         comparing_data = target_item.get("comparingData", [])
+#         accepted_sug_num = None
+       
+#         # First pass: determine which suggestion is accepted
+#         # Priority: explicit masterlist_id > _id in extra > metadata matching > first value match
+#         accepted_key = None
+#         req_id = req.masterlist_id or (req.model_extra.get("_id") if req.model_extra else None)
+       
+#         if req_id:
+#             for sug in comparing_data:
+#                 if sug.get("_id") == req_id:
+#                     accepted_key = next((k for k in sug.keys() if k.startswith("suggestion")), None)
+#                     break
+       
+#         if not accepted_key:
+#             # Find all candidates whose primary value matches
+#             candidates = []
+#             for sug in comparing_data:
+#                 match_key = next((k for k in sug.keys() if k.startswith("suggestion")), None)
+#                 if match_key and str(sug[match_key]) == str(req.accepted_value):
+#                     candidates.append(match_key)
+                   
+#             if len(candidates) == 1:
+#                 accepted_key = candidates[0]
+#             elif len(candidates) > 1:
+#                 # Disambiguate using metadata provided in the request
+#                 best_match_key = candidates[0]
+#                 best_match_score = -1
+               
+#                 for cand_key in candidates:
+#                     score = 0
+#                     for m_item in target_item.get("metadata", []):
+#                         m_name = m_item.get("name", "")
+                       
+#                         cand_m_val = None
+#                         for m_sug in m_item.get("comparingData", []):
+#                             if cand_key in m_sug:
+#                                 cand_m_val = m_sug[cand_key]
+#                                 break
+                               
+#                         if cand_m_val is None:
+#                             continue
+                           
+#                         # Extract the UI-provided value for this metadata field
+#                         ui_val = None
+#                         if hasattr(req, m_name):
+#                             ui_val = getattr(req, m_name, None)
+                       
+#                         # 2. Check the new metadata object (Priority)
+#                         if ui_val is None and req.metadata:
+#                             if m_name in req.metadata:
+#                                 ui_val = req.metadata[m_name]
+#                             elif m_name.lower() in req.metadata:
+#                                 ui_val = req.metadata[m_name.lower()]
+                       
+#                         # 3. Fallback to top-level extra properties
+#                         if ui_val is None and req.model_extra:
+#                             if m_name in req.model_extra:
+#                                 ui_val = req.model_extra[m_name]
+#                             elif m_name.lower() in req.model_extra:
+#                                 ui_val = req.model_extra[m_name.lower()]
+                       
+#                         # Special handling for coreCount aliases
+#                         if ui_val is None and m_name.lower() in ["corecount", "cpu(s)"]:
+#                             ui_val = req.coreCount
+#                             if ui_val is None:
+#                                 # Check metadata and model_extra for common aliases
+#                                 sources = [req.metadata, req.model_extra]
+#                                 for src in sources:
+#                                     if src:
+#                                         ui_val = src.get("CPU(s)") or src.get("cpu(s)")
+#                                         if ui_val is not None: break
+                       
+#                         if ui_val is not None and str(cand_m_val).lower() == str(ui_val).lower():
+#                             score += 1
+                           
+#                     if score > best_match_score:
+#                         best_match_score = score
+#                         best_match_key = cand_key
+                       
+#                 accepted_key = best_match_key
+ 
+#         # Second pass: apply the selected accepted_key
+#         for sug in comparing_data:
+#             match_key = next((k for k in sug.keys() if k.startswith("suggestion")), None)
+#             if not match_key: continue
+           
+#             if match_key == accepted_key:
+#                 sug["status"] = "Accepted"
+#                 suggestion_found = True
+#                 accepted_sug_num = match_key.replace("suggestion", "")
+#             else:
+#                 sug["status"] = "Rejected"
+       
+#         # Determine the source of the accepted value
+#         value_source = "suggestion" if suggestion_found else "dropdown"
+               
+#         # Always set to valid since we are finalizing a correction
+#         target_item["validation_status"] = "valid"
+#         target_item["currentStatus"] = req.currentStatus
+           
+#         # 4. Propagate the change to Executioninfo if a mapping exists
+#         if target_mapping:
+#             safe_mapping = target_mapping.replace(".sut.", ".sut.0.")
+#             await db[EXECUTION_INFO_COL].update_one(
+#                 {"benchmarkExecutionID": req.execution_id},
+#                 {"$set": {safe_mapping: req.accepted_value}}
+#             )
+       
+#         # 4.1 Collect potential manual overrides from the request (Priority: explicit fields > metadata > model_extra)
+#         manual_overrides = {}
+       
+#         # Helper to safely add values to overrides
+#         def add_override(k, v):
+#             if v is not None and str(v).strip() not in ["", "string", "None", "null"]:
+#                 if k not in manual_overrides: manual_overrides[k] = v
+#                 kl = k.lower()
+#                 if kl not in manual_overrides: manual_overrides[kl] = v
+ 
+#         if req.metadata:
+#             for k, v in req.metadata.items(): add_override(k, v)
+#         if req.model_extra:
+#             for k, v in req.model_extra.items(): add_override(k, v)
+#         if req.coreCount:
+#             add_override("coreCount", req.coreCount)
+#             add_override("corecount", req.coreCount)
+#             add_override("CPU(s)", req.coreCount)
+#             add_override("cpu(s)", req.coreCount)
+       
+#         # 4b. CASCADE: If this is a primary field, apply the same suggestion status to ALL metadata
+#         is_primary_field = False
+#         parent_item = None
+#         cascaded_changes = []  # Track (field_name, from_value, to_value) for history
+       
+#         for item in invalid_values:
+#             if item.get("field") == req.field_name:
+#                 is_primary_field = True
+#                 parent_item = item
+#                 break
+       
+#         if is_primary_field and parent_item:
+#             # Fetch metadata mappings for this primary field type
+#             m_info = await get_masterlist_mappings(req.field_name)
+#             meta_mappings = m_info.get("metadata_mappings", {})
+           
+#             # If Dropdown, dynamically fetch the Masterlist Record for the exact value they chose!
+#             dropdown_metadata = {}
+#             if value_source == "dropdown":
+#                 # Find the exact record using _id or metadata matching
+#                 dropdown_query = {
+#                     "type": {"$regex": f"^{req.field_name}$", "$options": "i"},
+#                     "data.value": req.accepted_value,
+#                     "status": "Published"
+#                 }
+               
+#                 req_id = req.masterlist_id or (req.model_extra.get("_id") if req.model_extra else None)
+#                 dropdown_ml_record = None
+               
+#                 if req_id:
+#                     dropdown_ml_record = await db[MASTERLIST_COL].find_one({"_id": req_id})
+               
+#                 if not dropdown_ml_record:
+#                     # Find all records with this value and pick the best metadata match
+#                     ml_candidates = await db[MASTERLIST_COL].find(dropdown_query).to_list(None)
+#                     if len(ml_candidates) == 1:
+#                         dropdown_ml_record = ml_candidates[0]
+#                     elif len(ml_candidates) > 1:
+#                         # Match against req.model_extra
+#                         best_ml = ml_candidates[0]
+#                         best_score = -1
+#                         for cand in ml_candidates:
+#                             score = 0
+#                             cand_meta = cand.get("data", {}).get("metadata", {})
+#                             for mk, mv in cand_meta.items():
+#                                 if mk.startswith("mapping_"): continue
+#                                 ui_val = req.model_extra.get(mk) or req.model_extra.get(mk.lower())
+#                                 if ui_val is None and mk.lower() == "corecount":
+#                                     ui_val = req.coreCount or req.model_extra.get("CPU(s)") or req.model_extra.get("cpu(s)")
+#                                 if ui_val is not None and str(mv).lower() == str(ui_val).lower():
+#                                     score += 1
+#                             if score > best_score:
+#                                 best_score = score
+#                                 best_ml = cand
+#                         dropdown_ml_record = best_ml
+               
+#                 if dropdown_ml_record:
+#                     dropdown_metadata = dropdown_ml_record.get("data", {}).get("metadata", {})
+           
+#             # Iterate over ALL mapped metadata fields for this primary field type
+#             for meta_name, meta_mapping in meta_mappings.items():
+#                 # 0. Identify the corresponding item in the snapshot metadata (if any)
+#                 meta_item = next((m for m in parent_item.get("metadata", []) if m.get("name") == meta_name), None)
+               
+#                 meta_original_value = meta_item.get("value") if meta_item else "Unknown"
+#                 meta_accepted_value = None
+#                 meta_comparing = meta_item.get("comparingData", []) if meta_item else []
+               
+#                 # 1. PRIORITY: Manual Override (Deliberate user edit from the request)
+#                 meta_source = "manual_edit"
+#                 # Look for exact or case-insensitive match in overrides
+#                 manual_val = manual_overrides.get(meta_name) or manual_overrides.get(str(meta_name).lower())
+               
+#                 if manual_val is not None:
+#                     # If the user edited it, we use their value!
+#                     meta_accepted_value = manual_val
+                    
+#                     # We must still update the statuses of the comparing data to Rejected
+#                     for sug in meta_comparing:
+#                         sug["status"] = "Rejected"
+#                 else:
+#                     # 2. PRIORITY: Suggestion (Matches the accepted primary suggestion)
+#                     meta_source = "cascaded"
+#                     if accepted_sug_num and meta_comparing:
+#                         for sug in meta_comparing:
+#                             sug_key = next((k for k in sug if k.startswith("suggestion")), None)
+#                             if sug_key and sug_key == f"suggestion{accepted_sug_num}":
+#                                 sug["status"] = "Accepted"
+#                                 meta_accepted_value = sug[sug_key]
+#                                 meta_source = "suggestion"
+#                             else:
+#                                 sug["status"] = "Rejected"
+#                     else:
+#                         # Not a suggestion approval or no suggestions for this meta field, reject all if they exist
+#                         for sug in meta_comparing:
+#                             sug["status"] = "Rejected"
+               
+#                 # 3. PRIORITY: Masterlist Record (Dropdown source only)
+#                 if meta_accepted_value is None and value_source == "dropdown":
+#                     # Default to "None" if missing in masterlist record
+#                     meta_accepted_value = "None"
+#                     meta_source = "masterlist"
+#                     for k, v in dropdown_metadata.items():
+#                         if k.lower() == str(meta_name).lower():
+#                             if v is not None and str(v).strip() != "":
+#                                 meta_accepted_value = v
+#                             break
+               
+#                 # 4. Final Fallback: If we have NO new value, skip this field (don't overwrite with None)
+#                 if meta_accepted_value is None:
+#                     continue
+ 
+#                 # Mark metadata as valid in the snapshot if it exists
+#                 if meta_item:
+#                     meta_item["validation_status"] = "valid"
+               
+#                 # Propagate metadata value to ExecutionInfo
+#                 if meta_mapping:
+#                     safe_meta_mapping = meta_mapping.replace(".sut.", ".sut.0.")
+#                     await db[EXECUTION_INFO_COL].update_one(
+#                         {"benchmarkExecutionID": req.execution_id},
+#                         {"$set": {safe_meta_mapping: meta_accepted_value}}
+#                     )
+               
+#                 # Track for history
+#                 cascaded_changes.append({
+#                     "field": meta_name,
+#                     "from": meta_original_value,
+#                     "to": meta_accepted_value,
+#                     "source": meta_source
+#                 })
+       
+#         # 5. Check for Overall Validity (Standardization Status)
+#         is_fully_resolved = True
+#         for item in invalid_values:
+#             if item.get("validation_status") != "valid":
+#                 is_fully_resolved = False
+#                 break
+#             for meta in item.get("metadata", []):
+#                 if meta.get("validation_status") != "valid":
+#                     is_fully_resolved = False
+#                     break
+#             if not is_fully_resolved: break
+   
+#         # 6. Update History (BUILD THIS BEFORE FINAL SYNC)
+#         history = snap_data.get("history", {})
+#         orig_from = history.get("from")
+#         orig_to = history.get("to")
+#         orig_field = history.get("valueField")
+#         orig_source = history.get("source")
+       
+#         new_from = orig_from if isinstance(orig_from, list) else ([orig_from] if orig_from else [])
+#         new_to = orig_to if isinstance(orig_to, list) else ([orig_to] if orig_to else [])
+#         new_field = orig_field if isinstance(orig_field, list) else ([orig_field] if orig_field else [])
+#         new_source = orig_source if isinstance(orig_source, list) else ([orig_source] if orig_source else [])
+       
+#         # Add primary field history
+#         new_from.append(original_value)
+#         new_to.append(req.accepted_value)
+#         new_field.append(req.field_name)
+#         new_source.append(value_source)
+       
+#         # Add cascaded metadata history
+#         for change in cascaded_changes:
+#             new_from.append(change["from"])
+#             new_to.append(change["to"])
+#             new_field.append(change["field"])
+#             new_source.append(change.get("source", "cascaded"))
+   
+#         snap_data["history"] = {
+#             "updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+#             "updatedBy": "xxx@amd.com",
+#             "from": new_from,
+#             "to": new_to,
+#             "valueField": new_field,
+#             "source": new_source
+#         }
+   
+#         # 7. Final Acceptance Transition & Consistency Sync
+#         if is_fully_resolved:
+#             snap_data["standardization_status"] = "ACCEPTED"
+           
+#             # --- FINAL CONSISTENCY SYNC (Double-Sync driven by History) ---
+#             ei_doc = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": req.execution_id})
+           
+#             if ei_doc:
+#                 # Build a lookup for mappings from the current snapshot structure
+#                 mapping_lookup = {}
+#                 for item in invalid_values:
+#                     field_name = item.get("field")
+#                     if field_name:
+#                         mapping_lookup[field_name] = item.get("mapping")
+#                     for meta in item.get("metadata", []):
+#                         meta_name = meta.get("name")
+#                         if meta_name:
+#                             mapping_lookup[meta_name] = meta.get("mapping")
+               
+#                 # Sync ALL fields currently present in the final history to Executioninfo
+#                 final_updates_applied = False
+#                 for i, field_name in enumerate(new_field):
+#                     m_path = mapping_lookup.get(field_name)
+#                     m_val = new_to[i] if i < len(new_to) else None
+                   
+#                     if m_path and m_val is not None:
+#                         final_updates_applied = True
+#                         # A. Update Flattened literal key
+#                         if m_path in ei_doc:
+#                             ei_doc[m_path] = m_val
+#                         # B. Update Nested Path
+#                         _set_nested_key(ei_doc, m_path, m_val)
+               
+#                 if final_updates_applied:
+#                     print(f"Applying Final History-Driven Double-Sync for {req.execution_id}")
+#                     await db[EXECUTION_INFO_COL].replace_one(
+#                         {"_id": ei_doc["_id"]},
+#                         ei_doc
+#                     )
+#         else:
+#             # Keep as PENDING if not all fields are resolved
+#             snap_data["standardization_status"] = "PENDING"
+   
+#         # 7. Update Executioninfo with latest results
+#         # Recalculate remaining invalid fields for the summary
+#         current_invalid_fields = sorted(list(set(
+#             [p.get("field") for p in invalid_values if p.get("validation_status") != "valid"] +
+#             [m.get("name") for p in invalid_values for m in p.get("metadata", []) if m.get("validation_status") != "valid"]
+#         )))
+       
+#         update_fields = {
+#             "isValid": is_fully_resolved,
+#             "invalidFields": current_invalid_fields,
+#             "lastModifiedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+#         }
+       
+#         # If fully resolved, ensure we clean up legacy fields
+#         unset_fields = {}
+#         if is_fully_resolved:
+#             unset_fields = {
+#                 "validated": "",
+#                 "standardized": "",
+#                 "fieldStatus": "",
+#                 "invalidPayload": ""
+#             }
+           
+#         await db[EXECUTION_INFO_COL].update_one(
+#             {"benchmarkExecutionID": req.execution_id},
+#             {"$set": update_fields, "$unset": unset_fields}
+#         )
+       
+#         # 8. Save entire Snapshot back
+#         await db[SNAPSHOT_COL].replace_one({"execution_id": req.execution_id}, snap)
+       
+#         # Broadcast update
+#         await manager.broadcast({
+#             "type": "PIPELINE_UPDATE",
+#             "execution_id": req.execution_id,
+#             "stage": "standardization completed",
+#             "status": snap_data["standardization_status"],
+#             "invalidFields": current_invalid_fields,
+#             "benchmarkType": snap.get("benchmark_type"),
+#             "benchmarkCategory": snap.get("benchmark_category"),
+#             "updatedOn": snap_data["history"].get("updatedOn"),
+#             "suggestionsCount": len(current_invalid_fields) > 0
+#         })
+#         await broadcast_summary(db)
+
+#         return {
+#             "status": "success",
+#             "message": f"Successfully {'accepted suggestion' if value_source == 'suggestion' else 'applied custom value'} for '{req.field_name}' and updated Executioninfo.",
+#             "execution_id": req.execution_id,
+#             "updated_field": req.field_name,
+#             "accepted_value": req.accepted_value,
+#             "mapping_path": target_mapping,
+#             "value_source": value_source
+#         }
+#     except Exception as e:
+#         import traceback
+#         error_details = traceback.format_exc()
+#         print(f"CRITICAL ERROR in approve_suggestion: {str(e)}\n{error_details}")
+#         raise HTTPException(
+#             status_code=500,
+#             detail={
+#                 "error": str(e),
+#                 "type": type(e).__name__,
+#                 "stacktrace": error_details
+#             }
+#         )
+
+
+
 @router.put("/approve-suggestion")
 async def approve_suggestion(req: ApproveSuggestionRequest):
     try:
         db = get_db()
-    
+   
         # 1. Fetch Snapshot
         snap = await db[SNAPSHOT_COL].find_one({"execution_id": req.execution_id})
         if not snap or not snap.get("data"):
             return {"status": "error", "message": f"Snapshot not found for Execution ID: {req.execution_id}"}
-        
+       
         snap_data = snap["data"][0]
         invalid_values = snap_data.get("invalidValues", [])
-        
+       
         # 2. Identify the selected field and suggestion (supporting nested metadata)
         target_item = None
         target_mapping = None
         original_value = None
         suggestion_found = False
-        
+       
         # Check top-level invalid fields first
         for item in invalid_values:
             if item.get("field") == req.field_name:
@@ -1453,7 +2027,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                 m_info = await get_masterlist_mappings(req.field_name)
                 target_mapping = m_info.get("mapping")
                 break
-            
+           
             # Check nested metadata fields
             for meta_item in item.get("metadata", []):
                 if meta_item.get("name") == req.field_name:
@@ -1464,29 +2038,112 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                     target_mapping = m_info.get("metadata_mappings", {}).get(req.field_name)
                     break
             if target_item: break
-    
+   
         if not target_item:
             return {"status": "error", "message": f"Field '{req.field_name}' not found in snapshot."}
-            
+           
         # 3. Update suggestion statuses
         comparing_data = target_item.get("comparingData", [])
         accepted_sug_num = None
+       
+        # First pass: determine which suggestion is accepted
+        # Priority: masterlist_id > _id > metadata matching > first value match
+        accepted_key = None
+        req_id = req.model_extra.get("masterlist_id") or req.model_extra.get("_id") if req.model_extra else None
+       
+        if req_id:
+            for sug in comparing_data:
+                if sug.get("_id") == req_id:
+                    accepted_key = next((k for k in sug.keys() if k.startswith("suggestion")), None)
+                    break
+       
+        if not accepted_key:
+            # Find all candidates whose primary value matches
+            candidates = []
+            for sug in comparing_data:
+                match_key = next((k for k in sug.keys() if k.startswith("suggestion")), None)
+                if match_key and str(sug[match_key]) == str(req.accepted_value):
+                    candidates.append(match_key)
+                   
+            if len(candidates) == 1:
+                accepted_key = candidates[0]
+            elif len(candidates) > 1:
+                # Disambiguate using metadata provided in the request
+                best_match_key = candidates[0]
+                best_match_score = -1
+               
+                for cand_key in candidates:
+                    score = 0
+                    for m_item in target_item.get("metadata", []):
+                        m_name = m_item.get("name", "")
+                       
+                        cand_m_val = None
+                        for m_sug in m_item.get("comparingData", []):
+                            if cand_key in m_sug:
+                                cand_m_val = m_sug[cand_key]
+                                break
+                               
+                        if cand_m_val is None:
+                            continue
+                           
+                        # Extract the UI-provided value for this metadata field
+                        ui_val = None
+                        if hasattr(req, m_name):
+                            ui_val = getattr(req, m_name, None)
+                       
+                        # 2. Check the new metadata object (Priority)
+                        if ui_val is None and req.metadata:
+                            if m_name in req.metadata:
+                                ui_val = req.metadata[m_name]
+                            elif m_name.lower() in req.metadata:
+                                ui_val = req.metadata[m_name.lower()]
+                       
+                        # 3. Fallback to top-level extra properties
+                        if ui_val is None and req.model_extra:
+                            if m_name in req.model_extra:
+                                ui_val = req.model_extra[m_name]
+                            elif m_name.lower() in req.model_extra:
+                                ui_val = req.model_extra[m_name.lower()]
+                       
+                        # Special handling for coreCount aliases
+                        if ui_val is None and m_name.lower() in ["corecount", "cpu(s)"]:
+                            ui_val = req.coreCount
+                            if ui_val is None:
+                                # Check metadata and model_extra for common aliases
+                                sources = [req.metadata, req.model_extra]
+                                for src in sources:
+                                    if src:
+                                        ui_val = src.get("CPU(s)") or src.get("cpu(s)")
+                                        if ui_val is not None: break
+                       
+                        if ui_val is not None and str(cand_m_val).lower() == str(ui_val).lower():
+                            score += 1
+                           
+                    if score > best_match_score:
+                        best_match_score = score
+                        best_match_key = cand_key
+                       
+                accepted_key = best_match_key
+ 
+        # Second pass: apply the selected accepted_key
         for sug in comparing_data:
             match_key = next((k for k in sug.keys() if k.startswith("suggestion")), None)
-            if match_key and sug[match_key] == req.accepted_value:
+            if not match_key: continue
+           
+            if match_key == accepted_key:
                 sug["status"] = "Accepted"
                 suggestion_found = True
                 accepted_sug_num = match_key.replace("suggestion", "")
             else:
                 sug["status"] = "Rejected"
-        
+       
         # Determine the source of the accepted value
         value_source = "suggestion" if suggestion_found else "dropdown"
-                
+               
         # Always set to valid since we are finalizing a correction
         target_item["validation_status"] = "valid"
         target_item["currentStatus"] = req.currentStatus
-            
+           
         # 4. Propagate the change to Executioninfo if a mapping exists
         if target_mapping:
             safe_mapping = target_mapping.replace(".sut.", ".sut.0.")
@@ -1494,124 +2151,213 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                 {"benchmarkExecutionID": req.execution_id},
                 {"$set": {safe_mapping: req.accepted_value}}
             )
-        
-        # 4.1 Handle Manual coreCount / CPU(s) Update (Frontend Driven)
-        manual_core_count = req.coreCount
-        manual_field_name = "coreCount"
-        # Fallback to 'CPU(s)' if 'coreCount' is not provided (handles UI change)
-        if manual_core_count is None and hasattr(req, 'model_extra') and req.model_extra:
-            manual_core_count = req.model_extra.get("CPU(s)")
-            if manual_core_count is not None:
-                manual_field_name = "CPU(s)"
-                
-        original_manual_value = "Unknown"
-        manual_update_occurred = False
-            
-        if manual_core_count is not None and str(manual_core_count).strip() not in ["", "string", "None", "null"]:
-            manual_update_occurred = True
-            # A. Update Executioninfo
-            await db[EXECUTION_INFO_COL].update_one(
-                {"benchmarkExecutionID": req.execution_id},
-                {"$set": {"platformProfile.sut.0.Summary.CPU.CPU(s)": manual_core_count}}
-            )
-            
-            # B. Also update the Snapshot record itself (Status only)
-            # We check both 'coreCount' and 'CPU(s)' field names for maximum compatibility
-            # We preserve the ORIGINAL value in data but mark it as valid
-            for item in invalid_values:
-                if item.get("field") in ["coreCount", "CPU(s)"]:
-                    original_manual_value = item.get("value")
-                    item["validation_status"] = "valid"
-                    # item["value"] = manual_core_count  # NO OVERWRITE: Preserve original detected value
-                    break
-                
-                for meta in item.get("metadata", []):
-                    if meta.get("name") in ["coreCount", "CPU(s)"]:
-                        original_manual_value = meta.get("value")
-                        meta["validation_status"] = "valid"
-                        # meta["value"] = manual_core_count  # NO OVERWRITE: Preserve original detected value
-                        break
-        
+       
+        # 4.1 Collect potential manual overrides from the request (Priority: explicit fields > metadata > model_extra)
+        manual_overrides = {}
+       
+        # Helper to safely add values to overrides
+        def add_override(k, v):
+            if v is not None and str(v).strip() not in ["", "string", "None", "null"]:
+                if k not in manual_overrides: manual_overrides[k] = v
+                kl = k.lower()
+                if kl not in manual_overrides: manual_overrides[kl] = v
+ 
+        if req.metadata:
+            for k, v in req.metadata.items(): add_override(k, v)
+        if req.model_extra:
+            for k, v in req.model_extra.items(): add_override(k, v)
+        if req.coreCount:
+            add_override("coreCount", req.coreCount)
+            add_override("corecount", req.coreCount)
+            add_override("CPU(s)", req.coreCount)
+            add_override("cpu(s)", req.coreCount)
+       
         # 4b. CASCADE: If this is a primary field, apply the same suggestion status to ALL metadata
         is_primary_field = False
         parent_item = None
         cascaded_changes = []  # Track (field_name, from_value, to_value) for history
-        
+       
         for item in invalid_values:
             if item.get("field") == req.field_name:
                 is_primary_field = True
                 parent_item = item
                 break
-        
+       
         if is_primary_field and parent_item:
             # Fetch metadata mappings for this primary field type
             m_info = await get_masterlist_mappings(req.field_name)
             meta_mappings = m_info.get("metadata_mappings", {})
-            
+           
             # If Dropdown, dynamically fetch the Masterlist Record for the exact value they chose!
             dropdown_metadata = {}
             if value_source == "dropdown":
-                dropdown_ml_record = await db[MASTERLIST_COL].find_one({
+                # Find the exact record using _id or metadata matching
+                dropdown_query = {
                     "type": {"$regex": f"^{req.field_name}$", "$options": "i"},
                     "data.value": req.accepted_value,
                     "status": "Published"
-                })
+                }
+               
+                req_id = req.model_extra.get("masterlist_id") or req.model_extra.get("_id") if req.model_extra else None
+                dropdown_ml_record = None
+               
+                if req_id:
+                    dropdown_ml_record = await db[MASTERLIST_COL].find_one({"_id": req_id})
+               
+                if not dropdown_ml_record:
+                    # Find all records with this value and pick the best metadata match
+                    ml_candidates = await db[MASTERLIST_COL].find(dropdown_query).to_list(None)
+                    if len(ml_candidates) == 1:
+                        dropdown_ml_record = ml_candidates[0]
+                    elif len(ml_candidates) > 1:
+                        # Match against req.model_extra
+                        best_ml = ml_candidates[0]
+                        best_score = -1
+                        for cand in ml_candidates:
+                            score = 0
+                            cand_meta = cand.get("data", {}).get("metadata", {})
+                            for mk, mv in cand_meta.items():
+                                if mk.startswith("mapping_"): continue
+                                ui_val = req.model_extra.get(mk) or req.model_extra.get(mk.lower())
+                                if ui_val is None and mk.lower() == "corecount":
+                                    ui_val = req.coreCount or req.model_extra.get("CPU(s)") or req.model_extra.get("cpu(s)")
+                                if ui_val is not None and str(mv).lower() == str(ui_val).lower():
+                                    score += 1
+                            if score > best_score:
+                                best_score = score
+                                best_ml = cand
+                        dropdown_ml_record = best_ml
+               
                 if dropdown_ml_record:
                     dropdown_metadata = dropdown_ml_record.get("data", {}).get("metadata", {})
-            
-            for meta_item in parent_item.get("metadata", []):
-                meta_name = meta_item.get("name")
-                
-                # Skip automated cascade for this field if it was manually updated in this request
-                if manual_update_occurred and meta_name == manual_field_name:
-                    continue
-                meta_original_value = meta_item.get("value")
+           
+            # Iterate over ALL mapped metadata fields for this primary field type
+            for meta_name, meta_mapping in meta_mappings.items():
+                # 0. Identify the corresponding item in the snapshot metadata (if any)
+                meta_item = next((m for m in parent_item.get("metadata", []) if m.get("name") == meta_name), None)
+               
+                meta_original_value = meta_item.get("value") if meta_item else "Unknown"
                 meta_accepted_value = None
-                meta_comparing = meta_item.get("comparingData", [])
-                
-                if accepted_sug_num:
-                    # Suggestion case: accept the same suggestion number, reject others
-                    for sug in meta_comparing:
-                        sug_key = next((k for k in sug if k.startswith("suggestion")), None)
-                        if sug_key and sug_key == f"suggestion{accepted_sug_num}":
-                            sug["status"] = "Accepted"
-                            meta_accepted_value = sug[sug_key]
-                        else:
-                            sug["status"] = "Rejected"
-                else:
-                    # Dropdown case: reject all metadata suggestions
+                meta_comparing = meta_item.get("comparingData", []) if meta_item else []
+               
+                # 1. PRIORITY: Manual Override (Deliberate user edit from the request)
+                meta_source = "manual_edit"
+                # Look for exact or case-insensitive match in overrides
+                manual_val = manual_overrides.get(meta_name) or manual_overrides.get(str(meta_name).lower())
+               
+                is_explicit_manual_override = False
+                if manual_val is not None:
+                    is_explicit_manual_override = True
+                    if accepted_sug_num and meta_comparing:
+                        for sug in meta_comparing:
+                            sug_key = next((k for k in sug if k.startswith("suggestion")), None)
+                            if sug_key == f"suggestion{accepted_sug_num}":
+                                sug_val = str(sug.get(sug_key, "")).strip().lower()
+                                man_val = str(manual_val).strip().lower()
+                                if sug_val == man_val:
+                                    is_explicit_manual_override = False
+                                else:
+                                    try:
+                                        if float(sug.get(sug_key, 0)) == float(manual_val):
+                                            is_explicit_manual_override = False
+                                    except:
+                                        if sug_val in ["none", "null", ""] and man_val in ["none", "null", ""]:
+                                            is_explicit_manual_override = False
+                                break
+
+                if is_explicit_manual_override:
+                    meta_accepted_value = manual_val
+                    # Ensure all suggestions are rejected since we are overriding manually
                     for sug in meta_comparing:
                         sug["status"] = "Rejected"
-                        
-                    # Dynamically fetch the correct metadata value from the database record!
-                    # Default to "None" to prevent preserving old invalid datums if missing in the Masterlist
+                else:
+                    # 2. PRIORITY: Suggestion (Matches the accepted primary suggestion)
+                    if accepted_sug_num and meta_comparing:
+                        meta_source = "suggestion"
+                        for sug in meta_comparing:
+                            sug_key = next((k for k in sug if k.startswith("suggestion")), None)
+                            if sug_key and sug_key == f"suggestion{accepted_sug_num}":
+                                sug["status"] = "Accepted"
+                                meta_accepted_value = sug[sug_key]
+                            else:
+                                sug["status"] = "Rejected"
+                    else:
+                        # Not a suggestion approval or no suggestions for this meta field, reject all if they exist
+                        meta_source = "cascaded"
+                        for sug in meta_comparing:
+                            sug["status"] = "Rejected"
+               
+                # 3. PRIORITY: Masterlist Record (Dropdown source only)
+                if meta_accepted_value is None and value_source == "dropdown":
+                    # Default to "None" if missing in masterlist record
                     meta_accepted_value = "None"
+                    meta_source = "masterlist"
                     for k, v in dropdown_metadata.items():
                         if k.lower() == str(meta_name).lower():
                             if v is not None and str(v).strip() != "":
                                 meta_accepted_value = v
                             break
-                
-                # Mark metadata as valid (do NOT update the value field in the snapshot)
-                meta_item["validation_status"] = "valid"
-                
-                # Propagate metadata value to ExecutionInfo if we have a suggestion value and mapping
-                if meta_accepted_value and meta_name:
-                    meta_mapping = meta_mappings.get(meta_name)
-                    if meta_mapping:
-                        safe_meta_mapping = meta_mapping.replace(".sut.", ".sut.0.")
-                        await db[EXECUTION_INFO_COL].update_one(
-                            {"benchmarkExecutionID": req.execution_id},
-                            {"$set": {safe_meta_mapping: meta_accepted_value}}
-                        )
-                
+               
+                # 4. Final Fallback: If we have NO new value, skip this field (don't overwrite with None)
+                if meta_accepted_value is None:
+                    continue
+ 
+                # Mark metadata as valid in the snapshot if it exists
+                if meta_item:
+                    meta_item["validation_status"] = "valid"
+               
+                # Propagate metadata value to ExecutionInfo
+                if meta_mapping:
+                    safe_meta_mapping = meta_mapping.replace(".sut.", ".sut.0.")
+                    await db[EXECUTION_INFO_COL].update_one(
+                        {"benchmarkExecutionID": req.execution_id},
+                        {"$set": {safe_meta_mapping: meta_accepted_value}}
+                    )
+               
                 # Track for history
                 cascaded_changes.append({
                     "field": meta_name,
                     "from": meta_original_value,
-                    "to": meta_accepted_value
+                    "to": meta_accepted_value,
+                    "source": meta_source
                 })
-        
+
+        # 4.1a Apply standalone Manual CPU(s) / coreCount update if provided and missed by cascade
+        manual_cpu_val = manual_overrides.get("cpu(s)") or manual_overrides.get("corecount")
+       
+        if manual_cpu_val is not None:
+            # Enforce it in Executioninfo
+            await db[EXECUTION_INFO_COL].update_one(
+                {"benchmarkExecutionID": req.execution_id},
+                {"$set": {"platformProfile.sut.0.Summary.CPU.CPU(s)": manual_cpu_val}}
+            )
+            # Find it in snapshot invalid_values to mark it valid if missed by the cascade
+            for item in invalid_values:
+                if item.get("field") in ["coreCount", "CPU(s)"] and item.get("validation_status") != "valid":
+                    cascaded_changes.append({
+                        "field": item.get("field"),
+                        "from": item.get("value"),
+                        "to": manual_cpu_val,
+                        "source": "manual_edit"
+                    })
+                    item["validation_status"] = "valid"
+                    item["currentStatus"] = req.currentStatus
+                    for sug in item.get("comparingData", []):
+                        sug["status"] = "Rejected"
+                   
+                for meta in item.get("metadata", []):
+                    if meta.get("name") in ["coreCount", "CPU(s)"] and meta.get("validation_status") != "valid":
+                        cascaded_changes.append({
+                            "field": meta.get("name"),
+                            "from": meta.get("value"),
+                            "to": manual_cpu_val,
+                            "source": "manual_edit"
+                        })
+                        meta["validation_status"] = "valid"
+                        meta["currentStatus"] = req.currentStatus
+                        for sug in meta.get("comparingData", []):
+                            sug["status"] = "Rejected"
+
         # 5. Check for Overall Validity (Standardization Status)
         is_fully_resolved = True
         for item in invalid_values:
@@ -1623,39 +2369,32 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                     is_fully_resolved = False
                     break
             if not is_fully_resolved: break
-    
+   
         # 6. Update History (BUILD THIS BEFORE FINAL SYNC)
         history = snap_data.get("history", {})
         orig_from = history.get("from")
         orig_to = history.get("to")
         orig_field = history.get("valueField")
         orig_source = history.get("source")
-        
+       
         new_from = orig_from if isinstance(orig_from, list) else ([orig_from] if orig_from else [])
         new_to = orig_to if isinstance(orig_to, list) else ([orig_to] if orig_to else [])
         new_field = orig_field if isinstance(orig_field, list) else ([orig_field] if orig_field else [])
         new_source = orig_source if isinstance(orig_source, list) else ([orig_source] if orig_source else [])
-        
+       
         # Add primary field history
         new_from.append(original_value)
         new_to.append(req.accepted_value)
         new_field.append(req.field_name)
         new_source.append(value_source)
-        
-        # Add Manual coreCount / CPU(s) update to history if it occurred strictly with a valid value
-        if manual_update_occurred:
-            new_from.append(original_manual_value)
-            new_to.append(manual_core_count)
-            new_field.append(manual_field_name)
-            new_source.append("manual_edit")
-        
+       
         # Add cascaded metadata history
         for change in cascaded_changes:
             new_from.append(change["from"])
             new_to.append(change["to"])
             new_field.append(change["field"])
-            new_source.append("cascaded")
-    
+            new_source.append(change.get("source", "cascaded"))
+   
         snap_data["history"] = {
             "updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             "updatedBy": "xxx@amd.com",
@@ -1664,14 +2403,14 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
             "valueField": new_field,
             "source": new_source
         }
-    
+   
         # 7. Final Acceptance Transition & Consistency Sync
         if is_fully_resolved:
             snap_data["standardization_status"] = "ACCEPTED"
-            
+           
             # --- FINAL CONSISTENCY SYNC (Double-Sync driven by History) ---
             ei_doc = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": req.execution_id})
-            
+           
             if ei_doc:
                 # Build a lookup for mappings from the current snapshot structure
                 mapping_lookup = {}
@@ -1683,13 +2422,13 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                         meta_name = meta.get("name")
                         if meta_name:
                             mapping_lookup[meta_name] = meta.get("mapping")
-                
+               
                 # Sync ALL fields currently present in the final history to Executioninfo
                 final_updates_applied = False
                 for i, field_name in enumerate(new_field):
                     m_path = mapping_lookup.get(field_name)
                     m_val = new_to[i] if i < len(new_to) else None
-                    
+                   
                     if m_path and m_val is not None:
                         final_updates_applied = True
                         # A. Update Flattened literal key
@@ -1697,7 +2436,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                             ei_doc[m_path] = m_val
                         # B. Update Nested Path
                         _set_nested_key(ei_doc, m_path, m_val)
-                
+               
                 if final_updates_applied:
                     print(f"Applying Final History-Driven Double-Sync for {req.execution_id}")
                     await db[EXECUTION_INFO_COL].replace_one(
@@ -1707,52 +2446,38 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
         else:
             # Keep as PENDING if not all fields are resolved
             snap_data["standardization_status"] = "PENDING"
-    
+   
         # 7. Update Executioninfo with latest results
         # Recalculate remaining invalid fields for the summary
         current_invalid_fields = sorted(list(set(
             [p.get("field") for p in invalid_values if p.get("validation_status") != "valid"] +
             [m.get("name") for p in invalid_values for m in p.get("metadata", []) if m.get("validation_status") != "valid"]
         )))
-        
+       
         update_fields = {
             "isValid": is_fully_resolved,
             "invalidFields": current_invalid_fields,
             "lastModifiedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         }
-        
+       
         # If fully resolved, ensure we clean up legacy fields
         unset_fields = {}
         if is_fully_resolved:
             unset_fields = {
-                "validated": "", 
+                "validated": "",
                 "standardized": "",
                 "fieldStatus": "",
                 "invalidPayload": ""
             }
-            
+           
         await db[EXECUTION_INFO_COL].update_one(
             {"benchmarkExecutionID": req.execution_id},
             {"$set": update_fields, "$unset": unset_fields}
         )
-        
+       
         # 8. Save entire Snapshot back
         await db[SNAPSHOT_COL].replace_one({"execution_id": req.execution_id}, snap)
-        
-        # Broadcast update
-        await manager.broadcast({
-            "type": "PIPELINE_UPDATE",
-            "execution_id": req.execution_id,
-            "stage": "standardization completed",
-            "status": snap_data["standardization_status"],
-            "invalidFields": current_invalid_fields,
-            "benchmarkType": snap.get("benchmark_type"),
-            "benchmarkCategory": snap.get("benchmark_category"),
-            "updatedOn": snap_data["history"].get("updatedOn"),
-            "suggestionsCount": len(current_invalid_fields) > 0
-        })
-        await broadcast_summary(db)
-        
+       
         return {
             "status": "success",
             "message": f"Successfully {'accepted suggestion' if value_source == 'suggestion' else 'applied custom value'} for '{req.field_name}' and updated Executioninfo.",
@@ -1767,13 +2492,14 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
         error_details = traceback.format_exc()
         print(f"CRITICAL ERROR in approve_suggestion: {str(e)}\n{error_details}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail={
                 "error": str(e),
                 "type": type(e).__name__,
                 "stacktrace": error_details
             }
         )
+ 
 
 @router.put("/reject-record")
 async def reject_record(req: RejectRecordRequest):
@@ -1815,7 +2541,10 @@ async def reject_record(req: RejectRecordRequest):
     # 5. Update Executioninfo to include the entitliment_level
     await db[EXECUTION_INFO_COL].update_one(
         {"benchmarkExecutionID": execution_id},
-        {"$set": {"entitliment_level": "L0 Junk Data."}}
+        {"$set": {
+            "entitliment_level": "L0 Junk Data.",
+            "lastModifiedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        }}
     )
 
     # 6. Save Snapshot
@@ -1959,6 +2688,14 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
         array_filters=[{"elem.field": {"$regex": f"^{actual_type}$", "$options": "i"}}]
     )
     
+    # 7. Update lastModifiedOn in ExecutionInfo for consistency
+    ei_filter = {"benchmarkExecutionID": draft.execution_id} if draft.execution_id else {}
+    if ei_filter:
+        await db[EXECUTION_INFO_COL].update_one(
+            ei_filter,
+            {"$set": {"lastModifiedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")}}
+        )
+    
     return {
         "status": "success",
         "message": f"Successfully drafted {actual_type} record to masterlist with 'In Review' status. Affected snapshots placed 'On Hold'.",
@@ -2021,9 +2758,21 @@ async def upload_execution_data(file: UploadFile = File(...)):
     db = get_db()
     try:
         result = await db[EXECUTION_INFO_COL].insert_many(records)
+        
+        # Mark ALL uploaded records as "validation initiated" so the UI
+        # immediately shows them as queued for processing
+        await db[EXECUTION_INFO_COL].update_many(
+            {"_id": {"$in": result.inserted_ids}},
+            {"$set": {"stage": "validation initiated", "lastModifiedOn": datetime.utcnow().isoformat()}}
+        )
+        
+        # Broadcast the updated summary so the dashboard reflects the new records instantly
+        await broadcast_summary(db)
+        
         return {
             "status": "success",
             "message": f"Successfully ingested {len(result.inserted_ids)} records",
+            "total_records": len(result.inserted_ids),
             "execution_ids": [r["benchmarkExecutionID"] for r in records]
         }
     except Exception as e:

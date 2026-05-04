@@ -1,7 +1,8 @@
 pymongo
 fastapi
-uvicorn
+uvicorn[standard]
 motor
 python-dotenv
 rapidfuzz
 python-multipart
+websockets

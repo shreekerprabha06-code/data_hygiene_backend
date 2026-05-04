@@ -1,4 +1,4 @@
-print("🔥 MAIN.PY IS RUNNING")
+print("[MAIN] MAIN.PY IS RUNNING")
 
 import os
 import uvicorn
@@ -24,12 +24,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ DEBUG HTTP ROUTE
+# DEBUG HTTP ROUTE
 @app.get("/")
 def test():
     return {"status": "ok"}
 
-# ✅ REAL-TIME WEBSOCKET ENDPOINT
+# REAL-TIME WEBSOCKET ENDPOINT
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
@@ -53,20 +53,38 @@ app.include_router(api_router)
 # Startup
 @app.on_event("startup")
 async def startup():
-    print("🚀 Data Hygiene API: Startup Sequence Initiated")
-    get_db()
+    print("[STARTUP] Data Hygiene API: Startup Sequence Initiated")
+    db = get_db()
 
-    # ✅ START BACKGROUND PIPELINES
+    # Ensure benchmarkExecutionID is always unique at the DB level
+    from database import EXECUTION_INFO_COL, SNAPSHOT_COL
+    try:
+        await db[EXECUTION_INFO_COL].create_index("benchmarkExecutionID", unique=True, name="benchmarkExecutionID_1")
+    except Exception:
+        pass  # Index already exists
+    
+    # Performance indexes for invalid-summary API
+    try:
+        await db[EXECUTION_INFO_COL].create_index([("stage", 1), ("lastModifiedOn", -1)])
+    except Exception:
+        pass  # Index already exists
+    try:
+        await db[SNAPSHOT_COL].create_index("execution_id")
+    except Exception:
+        pass  # Index already exists
+    print("[OK] All indexes enforced")
+
+    # START BACKGROUND PIPELINES
     # Validation & Standardization runners are async and safe to run here.
     asyncio.create_task(run_trigger())
-    print("✅ Background Pipelines: Validation & Standardization Started")
+    print("[OK] Background Pipelines: Validation & Standardization Started")
 
 # Shutdown
 @app.on_event("shutdown")
 async def shutdown():
     from database import close_db
     close_db()
-    print("🛑 Data Hygiene API: Shutdown Complete")
+    print("[SHUTDOWN] Data Hygiene API: Shutdown Complete")
 
 # Run
 if __name__ == "__main__":
