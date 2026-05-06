@@ -1,9 +1,11 @@
 import re
-import rapidfuzz
-from rapidfuzz import process, fuzz
 from typing import Dict, Any, Tuple, List, Set, Optional
 from utils import get_nested_value
 from database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, PROCESSOR_DETAILS_COL
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer, util
+import torch
 
 
 async def determine_field_types(db, mappings: Dict[str, str]) -> Dict[str, str]:
@@ -183,6 +185,10 @@ class Validator:
         self.val_metadata_reqs: Dict[str, Dict[str, List[Dict]]] = {t: {} for t in mappings}
         self.all_metadata_values: Dict[str, Dict[str, str]] = {}
         self.type_metadata_paths: Dict[str, Dict[str, str]] = {t: {} for t in mappings}
+        
+        print("Initializing SentenceTransformer model for ANN...")
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.simple_embeddings = {} # Cache for get_suggestions single-value embeddings
        
         # Cache for processor details to avoid redundant DB lookups during validation
         # Only ~500 records exist, so we cache the entire collection for O(1) lookups.
@@ -269,6 +275,43 @@ class Validator:
                     "primary_value": normalized_val,
                     "metadata": {mk: mv["required_val"] for mk, mv in meta_record.items()}
                 })
+        
+        print("Generating FAISS Index for masterlist signatures...")
+        self.faiss_indices = {}
+        # Pre-compute embeddings for all 'Mega-String' signatures
+        for t, configs in self.record_signatures.items():
+            if configs:
+                signatures = [c["signature"] for c in configs]
+                # Encode all signatures for this type in a batch
+                embeddings = self.model.encode(signatures, convert_to_numpy=True)
+                faiss.normalize_L2(embeddings)
+                
+                # Build FAISS Index for Cosine Similarity (Inner Product of L2-normalized vectors)
+                dimension = embeddings.shape[1]
+                index = faiss.IndexFlatIP(dimension)
+                index.add(embeddings)
+                
+                self.faiss_indices[t] = index
+                
+        # Pre-compute FAISS embeddings for single-value possibilities (for get_suggestions)
+        for t in self.mappings:
+            poss = list(self.valid_values.get(t, set()))
+            if not poss:
+                poss = list(self.all_metadata_values.get(t, {}).keys())
+            if poss:
+                embeddings = self.model.encode(poss, convert_to_numpy=True)
+                faiss.normalize_L2(embeddings)
+                
+                dimension = embeddings.shape[1]
+                index = faiss.IndexFlatIP(dimension)
+                index.add(embeddings)
+                
+                self.simple_embeddings[t] = {
+                    "values": poss,
+                    "index": index
+                }
+                
+        print("Initialization Complete.")
  
     def _normalize_value(self, field_name: str, value: str) -> str:
         """
@@ -286,27 +329,39 @@ class Validator:
 
     def get_suggestions(self, field_type: str, value: str, n: int = 3) -> List[Dict[str, Any]]:
         is_metadata = False
-        possibilities = list(self.valid_values.get(field_type, set()))
-        if not possibilities:
-            possibilities = list(self.all_metadata_values.get(field_type, {}).keys())
-            is_metadata = True
-           
-        if not possibilities or not value:
+        cached = self.simple_embeddings.get(field_type)
+        
+        if not cached or not value:
             return []
+            
+        possibilities = cached["values"]
+        index = cached["index"]
+        
+        # Check if it's metadata to find the right ID
+        if not self.valid_values.get(field_type, set()):
+            is_metadata = True
        
-        matches = process.extract(value, possibilities, limit=n, scorer=fuzz.partial_ratio, score_cutoff=10)
+        # Encode the query
+        query_embedding = self.model.encode([value], convert_to_numpy=True)
+        faiss.normalize_L2(query_embedding)
+        
+        # Search FAISS Index
+        k = min(n, len(possibilities))
+        D, I = index.search(query_embedding, k)
+        
         results = []
-        for i, match_info in enumerate(matches, 1):
-            match, score, _ = match_info
-           
+        for score, idx in zip(D[0], I[0]):
+            # If the score is extremely low, we might skip, but let's return top N for now
+            match = possibilities[idx]
+            
             if is_metadata:
                 match_id = self.all_metadata_values.get(field_type, {}).get(match, "")
             else:
                 match_id = self.value_ids.get(field_type, {}).get(match, "")
                
             results.append({
-                f"suggestion{i}": match,
-                f"score{i}": round(score / 100.0, 4),
+                f"suggestion{len(results)+1}": match,
+                f"score{len(results)+1}": round(float(score), 4),
                 "status": "PENDING",
                 "_id": match_id
             })
@@ -314,8 +369,8 @@ class Validator:
  
     def get_record_level_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None, n: int = 3) -> List[Dict[str, Any]]:
         """
-        Returns top N record-level suggestions using 'Mega-String' concatenated matching.
-        Combines primary value and metadata into a single string for high-accuracy fuzzy matching.
+        Returns top N record-level suggestions using ANN on 'Mega-String' embeddings.
+        Combines primary value and metadata into a single string for semantic matching.
         """
         if actual_metadata is None:
             actual_metadata = {}
@@ -325,40 +380,44 @@ class Validator:
             return []
             
         # 1. Build the 'Mega-String' signature for our ACTUAL record
-        # We include metadata values that exist to strengthen the search, but exclude null/none noise
         actual_signature_parts = [str(value).strip()]
         for m_name in sorted(actual_metadata.keys()):
             m_val = str(actual_metadata.get(m_name, "")).strip()
             if m_val:
                 actual_signature_parts.append(m_val)
         
-        # Clean the signature of null, none, -, and nan tokens
         cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
         actual_signature = " ".join(cleaned_parts).lower()
         
-        # 2. Extract signatures for matching
-        signature_strings = [c["signature"] for c in type_configs]
+        if not actual_signature:
+            return []
+            
+        index = self.faiss_indices.get(field_type)
+        if not index:
+            return []
+            
+        # 3. Perform Vector Search (Cosine Similarity via FAISS)
+        query_embedding = self.model.encode([actual_signature], convert_to_numpy=True)
+        faiss.normalize_L2(query_embedding)
         
-        # 3. Perform Fuzzy Search using token_set_ratio on Mega-Strings
-        # This handles noisy names effectively by comparing intersections to the full token sets.
-        matches = process.extract(actual_signature, signature_strings, limit=n, scorer=fuzz.token_set_ratio, score_cutoff=75)
+        k = min(n, len(type_configs))
+        D, I = index.search(query_embedding, k)
         
         results = []
-        for match_str, score, index in matches:
-            config = type_configs[index]
+        for score, idx in zip(D[0], I[0]):
+            config = type_configs[idx]
             results.append({
                 "_id": config["record_id"],
                 "primary_value": config["primary_value"],
                 "metadata": config["metadata"],
-                "score": round(score / 100.0, 4)
+                "score": round(float(score), 4)
             })
             
         return results
 
     def has_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None) -> bool:
         """
-        Fast-path check: returns True if any record-level fuzzy match exists with score >= 75.
-        Optimized by stopping at the first match found.
+        Fast-path check: returns True if any record-level ANN match exists with cosine similarity >= 0.70.
         """
         if actual_metadata is None:
             actual_metadata = {}
@@ -378,10 +437,19 @@ class Validator:
         if not actual_signature:
             return False
             
-        # Perform Fuzzy Search existence check (extractOne is fastest)
-        match = process.extractOne(actual_signature, [c["signature"] for c in type_configs], scorer=fuzz.token_set_ratio, score_cutoff=75)
+        index = self.faiss_indices.get(field_type)
+        if not index:
+            return False
+            
+        # Perform Vector Search via FAISS
+        query_embedding = self.model.encode([actual_signature], convert_to_numpy=True)
+        faiss.normalize_L2(query_embedding)
         
-        return match is not None
+        D, I = index.search(query_embedding, 1)
+        best_score = float(D[0][0]) if len(D[0]) > 0 else 0.0
+        
+        # Using 0.7 as the confidence threshold for Cosine Similarity
+        return best_score >= 0.70
 
     async def validate_doc(self, db, doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         # 1. Extract values for each mapped field (normalize based on detected type)

@@ -6,3 +6,5 @@ python-dotenv
 rapidfuzz
 python-multipart
 websockets
+sentence-transformers
+faiss-cpu

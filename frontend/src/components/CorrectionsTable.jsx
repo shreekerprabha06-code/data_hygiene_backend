@@ -443,7 +443,7 @@ const CorrectionsTable = ({ data, history, execID, sutType, fetchData, showNotif
 
                   {isPending && (
                     <Chip
-                      label="Pending"
+                      label="Action Required"
                       size="small"
                       sx={{
                         height: 18,

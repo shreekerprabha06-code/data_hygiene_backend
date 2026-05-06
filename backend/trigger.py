@@ -634,78 +634,18 @@ async def run_trigger():
     await broadcast_summary(db)
     logger.info("Initial summary broadcast complete.")
  
-    # Try Change Stream first (requires MongoDB Replica Set)
+    logger.info("Starting dual pipelines: Validation + Standardization (both polling)...")
+
+    # Run BOTH pipelines in parallel using the reliable polling method
+    # This guarantees no records are missed even if they were uploaded while the server was offline
     try:
-        logger.info(f"Attempting to start Change Stream on: {EXECUTION_INFO_COL}")
- 
-        pipeline = [
-            {"$match": {
-                "operationType": {"$in": ["insert", "replace", "update"]}
-            }}
-        ]
- 
-        # For Change Stream mode, we still run both pipelines in parallel
-        # Change Stream handles real-time validation; standardization pipeline picks up after
-        async def _change_stream_validation():
-            async with collection.watch(pipeline, full_document="updateLookup") as stream:
-                logger.info("[CHANGE STREAM] Active. Listening for new records...")
-                count = 0
-                async for change in stream:
-                    op_type = change["operationType"]
-                    doc = change.get("fullDocument")
-                    if not doc: continue
- 
-                    doc_id = doc.get("_id")
- 
-                    # --- AUTO-RESET LOGIC ---
-                    # If an existing record is updated with NEW DATA, we must re-trigger validation.
-                    if op_type == "update":
-                        updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
-                        # Check if any of the updated fields are "Real Data" (not internal statuses)
-                        real_data_changed = any(f for f in updated_fields if f not in INTERNAL_FIELDS)
-                       
-                        if real_data_changed:
-                            logger.info(f"[TRIGGER] Data change detected for {doc_id}. Resetting stage to 'validation initiated'...")
-                            await collection.update_one(
-                                {"_id": doc_id},
-                                {"$set": {"stage": "validation initiated"}, "$unset": {"isValid": "", "invalidFields": "", "invalidPayload": "", "fieldStatus": ""}}
-                            )
-                            # The polling loop will pick it up in the next cycle
-                            continue
- 
-                    # --- START PROCESSING LOGIC ---
-                    # Only start processing if the record is in 'validation initiated' state
-                    if doc.get("stage") == "validation initiated":
-                        count += 1
-                        logger.info(f"[CHANGE STREAM] Processing Record #{count} ({doc_id})")
-                        await validate_document(db, validator, doc)
- 
-        # Run Change Stream validation + Standardization pipeline in parallel
-        logger.info("Starting dual pipelines: Change Stream (Validation) + Polling (Standardization)...")
         await asyncio.gather(
-            _change_stream_validation(),
+            run_validation_pipeline(db, validator, EXECUTION_INFO_COL),
             run_standardization_pipeline(db, validator, EXECUTION_INFO_COL)
         )
- 
-    except (OperationFailure, PyMongoError) as e:
-        err_msg = str(e)
-        if isinstance(e, OperationFailure) and e.code == 40573 or "not support change streams" in err_msg.lower():
-            logger.warning("Change Streams not supported (Standalone MongoDB). Switching to Polling Mode.")
-            logger.info("Starting dual pipelines: Validation + Standardization (both polling)...")
- 
-            # Run BOTH pipelines in parallel
-            await asyncio.gather(
-                run_validation_pipeline(db, validator, EXECUTION_INFO_COL),
-                run_standardization_pipeline(db, validator, EXECUTION_INFO_COL)
-            )
-        else:
-            logger.error(f"MongoDB error: {err_msg}")
-            logger.info("Restarting trigger in 5 seconds...")
-            await asyncio.sleep(5)
-            await run_trigger()
- 
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Pipeline crashed: {str(e)}")
+        logger.info("Restarting trigger in 5 seconds...")
         await asyncio.sleep(5)
         await run_trigger()
  
