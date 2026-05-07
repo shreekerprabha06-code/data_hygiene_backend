@@ -260,8 +260,7 @@ async def get_invalid_summary(
 
     async def _fetch_age_counts():
         if not search_query:
-            from app.services import pipeline
-            _cached = pipeline._LAST_SUMMARY
+            _cached = await db["SystemCache"].find_one({"_id": "LAST_SUMMARY"}) or {}
             return {"red": _cached.get("red", 0), "yellow": _cached.get("yellow", 0), "green": _cached.get("green", 0)}
         else:
             age_search_query = {}
@@ -271,46 +270,25 @@ async def get_invalid_summary(
             return await get_dynamic_age_counts(db, age_search_query)
 
     async def _fetch_stage_counts():
-        stage_agg = await db[EXECUTION_INFO_COL].aggregate([
-            {"$match": {"stage": {"$exists": True}}},
-            {"$group": {"_id": "$stage", "count": {"$sum": 1}}}
-        ]).to_list(20)
-        raw_stages = {str(s["_id"] or "unknown").lower(): s["count"] for s in stage_agg}
+        _cached = await db["SystemCache"].find_one({"_id": "LAST_SUMMARY"}) or {}
         return {
-            "VALIDATION_INITIATED": raw_stages.get("validation initiated", 0),
-            "VALIDATION_IN_PROGRESS": (
-                raw_stages.get("validation inprogress", 0) +
-                raw_stages.get("validation failed", 0)
-            ),
-            "VALIDATION_COMPLETED": raw_stages.get("validation completed", 0),
-            "STANDARDIZATION_IN_PROGRESS": (
-                raw_stages.get("standardization inprogress", 0) +
-                raw_stages.get("standardization failed", 0)
-            ),
-            "STANDARDIZATION_COMPLETED": raw_stages.get("standardization completed", 0),
+            "VALIDATION_INITIATED": _cached.get("VALIDATION_INITIATED", 0),
+            "VALIDATION_IN_PROGRESS": _cached.get("VALIDATION_IN_PROGRESS", 0),
+            "VALIDATION_COMPLETED": _cached.get("VALIDATION_COMPLETED", 0),
+            "STANDARDIZATION_IN_PROGRESS": _cached.get("STANDARDIZATION_IN_PROGRESS", 0),
+            "STANDARDIZATION_COMPLETED": _cached.get("STANDARDIZATION_COMPLETED", 0),
         }
 
 
     async def _fetch_status_counts():
-        # Query Snapshot collection DIRECTLY - no expensive $lookup needed
-        status_results = await db[SNAPSHOT_COL].aggregate([
-            {"$project": {
-                "status": {
-                    "$cond": {
-                        "if": {"$and": [{"$isArray": "$data"}, {"$gt": [{"$size": "$data"}, 0]}]},
-                        "then": {"$arrayElemAt": ["$data.standardization_status", 0]},
-                        "else": "PENDING"
-                    }
-                }
-            }},
-            {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-        ]).to_list(20)
-        counts = {"PENDING": 0, "REJECTED": 0, "ACCEPTED": 0, "ON HOLD": 0, "N/A": 0}
-        for s in status_results:
-            key = str(s["_id"] or "N/A").upper()
-            if key in counts: counts[key] = s["count"]
-            else: counts["N/A"] += s["count"]
-        return counts
+        _cached = await db["SystemCache"].find_one({"_id": "LAST_SUMMARY"}) or {}
+        return {
+            "PENDING": _cached.get("PENDING", 0),
+            "REJECTED": _cached.get("REJECTED", 0),
+            "ACCEPTED": _cached.get("ACCEPTED", 0),
+            "ON HOLD": _cached.get("ON HOLD", 0),
+            "N/A": _cached.get("N/A", 0)
+        }
 
     # Execute ALL 5 queries in parallel
     invalid_records, total_records, summary_counts, grouped_stages, status_counts = await asyncio.gather(

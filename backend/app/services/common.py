@@ -6,13 +6,8 @@ from app.services.ws_manager import manager
 
 def create_service_app(title: str, version: str = "1.0.0") -> FastAPI:
     app = FastAPI(title=title, version=version)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # Note: CORSMiddleware is removed because NGINX acts as the API Gateway 
+    # and strictly handles all CORS headers. Having it here causes duplicate headers.
     return app
 
 

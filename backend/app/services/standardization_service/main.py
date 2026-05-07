@@ -26,6 +26,14 @@ include_selected_routes(
 add_websocket_endpoint(app)
 
 
+from app.services.validation import get_validator
+
+@app.on_event("startup")
+async def startup():
+    print("Pre-loading AI Validator Model...")
+    await get_validator()
+    print("Validator Model Loaded.")
+
 @app.on_event("shutdown")
 async def shutdown():
     close_db()

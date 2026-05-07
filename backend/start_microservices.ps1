@@ -22,7 +22,8 @@ $Services = @(
     @{ Name = "pipeline-service"; Port = 8002; Module = "app.services.pipeline_service.main:app" },
     @{ Name = "standardization-service"; Port = 8003; Module = "app.services.standardization_service.main:app" },
     @{ Name = "ingestion-service"; Port = 8004; Module = "app.services.ingestion_service.main:app" },
-    @{ Name = "trigger-service"; Port = 8005; Module = "app.services.trigger_service.main:app" }
+    @{ Name = "trigger-service"; Port = 8005; Module = "app.services.trigger_service.main:app" },
+    @{ Name = "auth-service"; Port = 8006; Module = "app.services.auth_service.main:app" }
 )
 
 Write-Host "Backend directory: $BackendDir"

@@ -141,6 +141,13 @@ async def broadcast_summary(db):
    
     async with _SUMMARY_LOCK:
         _LAST_SUMMARY = summary
+        
+    # Save cache to DB for other microservices to read instantly
+    await db["SystemCache"].replace_one(
+        {"_id": "LAST_SUMMARY"},
+        summary,
+        upsert=True
+    )
  
     await manager.broadcast({
         "type": "PIPELINE_UPDATE",
