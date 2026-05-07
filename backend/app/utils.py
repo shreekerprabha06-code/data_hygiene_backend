@@ -1,5 +1,5 @@
 from typing import Dict, Set, List, Tuple, Any, Optional
-from database import MASTERLIST_COL
+from app.core.database import MASTERLIST_COL
 
 def get_nested_value(doc: Dict[str, Any], keys: str) -> Any:
     """Retrieve a nested value from dictionary using dot-separated keys, or fallback to exact match."""

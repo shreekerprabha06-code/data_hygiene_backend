@@ -1,11 +1,21 @@
 import re
 from typing import Dict, Any, Tuple, List, Set, Optional
-from utils import get_nested_value
-from database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, PROCESSOR_DETAILS_COL
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer, util
-import torch
+from app.utils import get_nested_value
+from app.core.database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, PROCESSOR_DETAILS_COL
+
+
+def _load_ann_dependencies():
+    try:
+        import faiss
+        from sentence_transformers import SentenceTransformer
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "ANN suggestion dependencies are missing. Install backend requirements, "
+            "especially faiss-cpu and sentence-transformers, before running validation, "
+            "standardization, or trigger services."
+        ) from exc
+
+    return faiss, SentenceTransformer
 
 
 async def determine_field_types(db, mappings: Dict[str, str]) -> Dict[str, str]:
@@ -176,6 +186,9 @@ IGNORED_SIGNATURE_VALUES = {"", "none", "null", "nan", "-", "na", "n/a", "undefi
 
 class Validator:
     def __init__(self, ml_records, mappings: Dict[str, str], field_types: Dict[str, str] = None):
+        faiss, SentenceTransformer = _load_ann_dependencies()
+        self.faiss = faiss
+
         self.mappings = mappings
         self.field_types = field_types or {}  # {"coreCount": "INTEGER", "CPUModel": "STRING", ...}
        
@@ -284,11 +297,11 @@ class Validator:
                 signatures = [c["signature"] for c in configs]
                 # Encode all signatures for this type in a batch
                 embeddings = self.model.encode(signatures, convert_to_numpy=True)
-                faiss.normalize_L2(embeddings)
+                self.faiss.normalize_L2(embeddings)
                 
                 # Build FAISS Index for Cosine Similarity (Inner Product of L2-normalized vectors)
                 dimension = embeddings.shape[1]
-                index = faiss.IndexFlatIP(dimension)
+                index = self.faiss.IndexFlatIP(dimension)
                 index.add(embeddings)
                 
                 self.faiss_indices[t] = index
@@ -300,10 +313,10 @@ class Validator:
                 poss = list(self.all_metadata_values.get(t, {}).keys())
             if poss:
                 embeddings = self.model.encode(poss, convert_to_numpy=True)
-                faiss.normalize_L2(embeddings)
+                self.faiss.normalize_L2(embeddings)
                 
                 dimension = embeddings.shape[1]
-                index = faiss.IndexFlatIP(dimension)
+                index = self.faiss.IndexFlatIP(dimension)
                 index.add(embeddings)
                 
                 self.simple_embeddings[t] = {
@@ -343,7 +356,7 @@ class Validator:
        
         # Encode the query
         query_embedding = self.model.encode([value], convert_to_numpy=True)
-        faiss.normalize_L2(query_embedding)
+        self.faiss.normalize_L2(query_embedding)
         
         # Search FAISS Index
         k = min(n, len(possibilities))
@@ -398,7 +411,7 @@ class Validator:
             
         # 3. Perform Vector Search (Cosine Similarity via FAISS)
         query_embedding = self.model.encode([actual_signature], convert_to_numpy=True)
-        faiss.normalize_L2(query_embedding)
+        self.faiss.normalize_L2(query_embedding)
         
         k = min(n, len(type_configs))
         D, I = index.search(query_embedding, k)
@@ -443,7 +456,7 @@ class Validator:
             
         # Perform Vector Search via FAISS
         query_embedding = self.model.encode([actual_signature], convert_to_numpy=True)
-        faiss.normalize_L2(query_embedding)
+        self.faiss.normalize_L2(query_embedding)
         
         D, I = index.search(query_embedding, 1)
         best_score = float(D[0][0]) if len(D[0]) > 0 else 0.0

@@ -1,5 +1,5 @@
 import asyncio
-from database import get_db, EXECUTION_INFO_COL
+from app.core.database import get_db, EXECUTION_INFO_COL
 
 async def check():
     db = get_db()

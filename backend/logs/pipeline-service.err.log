@@ -1,0 +1,3 @@
+INFO:     Will watch for changes in these directories: ['C:\\Users\\user\\Desktop\\Data Hygiene New Masterlist POC FINAL MONDOY\\Data Hygiene New Masterlist\\backend']
+INFO:     Uvicorn running on http://0.0.0.0:8002 (Press CTRL+C to quit)
+INFO:     Started reloader process [2260] using WatchFiles
