@@ -18,7 +18,6 @@ if (Test-Path ".\.venv\Scripts\python.exe") {
 }
 
 $Services = @(
-    @{ Name = "api-gateway"; Port = 8000; Module = "app.services.api_gateway.main:app" },
     @{ Name = "masterlist-service"; Port = 8001; Module = "app.services.masterlist_service.main:app" },
     @{ Name = "pipeline-service"; Port = 8002; Module = "app.services.pipeline_service.main:app" },
     @{ Name = "standardization-service"; Port = 8003; Module = "app.services.standardization_service.main:app" },
@@ -28,6 +27,10 @@ $Services = @(
 
 Write-Host "Backend directory: $BackendDir"
 Write-Host "Logs directory: $LogDir"
+
+Write-Host "Starting NGINX API Gateway on port 8000..."
+$NginxConf = Join-Path $BackendDir "nginx.conf"
+Start-Process -FilePath "C:\nginx\nginx.exe" -ArgumentList "-c `"$NginxConf`"" -WorkingDirectory "C:\nginx" -WindowStyle Hidden
 
 foreach ($Service in $Services) {
     Write-Host "Starting $($Service.Name) on port $($Service.Port)..."

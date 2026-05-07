@@ -13,9 +13,12 @@ foreach ($Port in $Ports) {
 
 $Pids = $Pids | Sort-Object -Unique
 
-foreach ($Pid in $Pids) {
-    if ($Pid -and $Pid -ne 0) {
-        Write-Host "Stopping PID $Pid"
-        Stop-Process -Id $Pid -Force -ErrorAction SilentlyContinue
+Write-Host "Stopping NGINX"
+Stop-Process -Name "nginx" -Force -ErrorAction SilentlyContinue
+
+foreach ($ProcId in $Pids) {
+    if ($ProcId -and $ProcId -ne 0) {
+        Write-Host "Stopping PID $ProcId"
+        Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
     }
 }
