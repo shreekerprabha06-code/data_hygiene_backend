@@ -625,13 +625,19 @@ class Validator:
         return invalid_payload, field_status
  
 import time
-_validator_cache = {"instance": None, "updated_at": 0}
-CACHE_TTL = 300  # 5 minutes
+_validator_cache = {"instance": None}
+
+def invalidate_validator_cache() -> None:
+    """
+    Invalidates the cached Validator instance to force a full rebuild
+    of the model and vector search indexes on the next request.
+    """
+    global _validator_cache
+    _validator_cache["instance"] = None
 
 async def get_validator() -> Validator:
     global _validator_cache
-    now = time.time()
-    if _validator_cache["instance"] and (now - _validator_cache["updated_at"]) < CACHE_TTL:
+    if _validator_cache["instance"]:
         return _validator_cache["instance"]
         
     db = get_db()
@@ -651,5 +657,4 @@ async def get_validator() -> Validator:
             validator.processor_cache[str(model_no)] = proc
     
     _validator_cache["instance"] = validator
-    _validator_cache["updated_at"] = now
     return validator
