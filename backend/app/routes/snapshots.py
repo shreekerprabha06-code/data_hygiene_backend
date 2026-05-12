@@ -2,22 +2,24 @@
 Snapshot & Record Detail Routes
 Handles: /snapshot-records/{id}, /metadata-values/{type}/{value}, /unique-values, /search-snapshots
 """
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import asyncio
+from pydantic import BaseModel
 from app.core.database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from app.services.validation import build_mappings, get_validator
 from app.services.helpers import (
     get_masterlist_mappings, resolve_fuzzy_benchmarks, get_masterlist_values,
-    _get_dynamic_field_map, _get_masterlist_all_unique_values
+    _get_dynamic_field_map, _get_masterlist_all_unique_values, get_current_user,
+    build_expertise_query_filter
 )
 
 router = APIRouter()
 
 
 @router.get("/snapshot-records/{Execution_id}")
-async def get_snapshot_records(Execution_id: str):
+async def get_snapshot_records(Execution_id: str, user: dict = Depends(get_current_user)):
     """
     Fetches a specific record from the snapshot collection by Execution_id (Path Parameter).
     Flattens invalid metadata into a simple Data array with mappings.
@@ -25,6 +27,26 @@ async def get_snapshot_records(Execution_id: str):
     db = get_db()
     Execution_id = Execution_id.strip()
     
+    # Fetch metadata from ExecutionInfo
+    exec_meta = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": Execution_id})
+    if not exec_meta:
+        exec_meta = {}
+        
+    # Enforce domain expertise restriction: SMEs are restricted, Admins bypass
+    if user.get("role", "").upper() == "SME":
+        expert_cats = user.get("benchmarkCategories", user.get("expertise", []))
+        exp_filter = await build_expertise_query_filter(expert_cats, db)
+        if exp_filter:
+            allowed_record = await db[EXECUTION_INFO_COL].find_one({
+                "benchmarkExecutionID": Execution_id,
+                **exp_filter
+            })
+            if not allowed_record:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Access Denied: You do not have registered expertise to view this record."
+                )
+            
     doc = await db[SNAPSHOT_COL].find_one({"execution_id": Execution_id})
     
     if not doc or not doc.get("data"):
@@ -32,12 +54,6 @@ async def get_snapshot_records(Execution_id: str):
             "status": "error",
             "message": f"No snapshot record found for Execution_id: {Execution_id}"
         }
-
-    # Fetch metadata from ExecutionInfo
-    exec_meta = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": Execution_id})
-    if not exec_meta:
-        # Fallback to empty if not found, though it should exist
-        exec_meta = {}
 
     item = doc["data"][0]
     validator = await get_validator()
@@ -294,7 +310,7 @@ async def get_snapshot_records(Execution_id: str):
             "sutType":           sut_type,
             "runCategory":       exec_meta.get("runCategory"),
             "createdOn":         created_on,
-            "tester":            exec_meta.get("tester"),
+            "tester":            exec_meta.get("tester") or (exec_meta.get("assignment") or {}).get("assigned_sme", ""),
             "resultType":        exec_meta.get("resultType"),
         },
         "data": data_list,
@@ -447,7 +463,9 @@ async def search_snapshots(
     benchmarkCategory: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1, le=500)
+    size: int = Query(50, ge=1, le=500),
+    assigned_only: Optional[str] = Query(None, description="If 'true', only returns records assigned to the logged-in user"),
+    user: dict = Depends(get_current_user)
 ):
     db = get_db()
     
@@ -455,34 +473,61 @@ async def search_snapshots(
     resolved = await resolve_fuzzy_benchmarks(benchmarkType, benchmarkCategory)
     
     # 1. First, search ExecutionInfo to get the IDs of benchmarks that match
-    exec_query = {}
-    if "benchmarkType" in resolved:
-        if resolved.get("benchmarkType_is_fuzzy"):
-            exec_query["benchmarkType"] = resolved["benchmarkType"]
-        else:
-            exec_query["benchmarkType"] = {"$regex": resolved["benchmarkType"], "$options": "i"}
+    final_exec_filters = []
+    
+    role = user.get("role", "").upper()
+    is_assigned_only = str(assigned_only).lower() == "true"
+    
+    if role == "SME":
+        expert_cats = user.get("benchmarkCategories", user.get("expertise", []))
+        exp_filter = await build_expertise_query_filter(expert_cats, db, username=user.get("username"), assigned_only=is_assigned_only)
+        if exp_filter:
+            final_exec_filters.append(exp_filter)
+    elif role == "ADMIN" and is_assigned_only:
+        assignee_matches = []
+        u_name = user.get("username")
+        u_email = user.get("email")
+        if u_name:
+            assignee_matches.extend([{"tester": u_name}, {"assignment.assigned_sme": u_name}])
+        if u_email:
+            assignee_matches.extend([{"tester": u_email}, {"assignment.assigned_sme": u_email}])
+        if assignee_matches:
+            final_exec_filters.append({"$or": assignee_matches})
             
-    if "benchmarkCategory" in resolved:
-        if resolved.get("benchmarkCategory_is_fuzzy"):
-            exec_query["benchmarkCategory"] = resolved["benchmarkCategory"]
-        else:
-            exec_query["benchmarkCategory"] = {"$regex": resolved["benchmarkCategory"], "$options": "i"}
+    # Add resolved filters for individual benchmarkType / benchmarkCategory parameters
+    if benchmarkType or benchmarkCategory:
+        resolved_filter = {}
+        if "benchmarkType" in resolved:
+            if resolved.get("benchmarkType_is_fuzzy"):
+                resolved_filter["benchmarkType"] = resolved["benchmarkType"]
+            else:
+                resolved_filter["benchmarkType"] = {"$regex": resolved["benchmarkType"], "$options": "i"}
+                
+        if "benchmarkCategory" in resolved:
+            cat_val = resolved["benchmarkCategory"]
+            if resolved.get("benchmarkCategory_is_fuzzy"):
+                resolved_filter["benchmarkCategory"] = cat_val
+            else:
+                resolved_filter["benchmarkCategory"] = {"$regex": cat_val, "$options": "i"}
+        if resolved_filter:
+            final_exec_filters.append(resolved_filter)
 
     if search:
         search_regex = {"$regex": search, "$options": "i"}
         # Fuzzy resolution for both Type and Category
-        resolved = await resolve_fuzzy_benchmarks(benchmarkType=search, benchmarkCategory=search)
+        resolved_search = await resolve_fuzzy_benchmarks(benchmarkType=search, benchmarkCategory=search)
         or_filters = [{"benchmarkExecutionID": search_regex}]
         
-        if "benchmarkType" in resolved:
-            if resolved.get("benchmarkType_is_fuzzy"):
-                or_filters.append({"benchmarkType": resolved["benchmarkType"]})
+        if "benchmarkType" in resolved_search:
+            if resolved_search.get("benchmarkType_is_fuzzy"):
+                or_filters.append({"benchmarkType": resolved_search["benchmarkType"]})
             else:
                 or_filters.append({"benchmarkType": search_regex})
         
-        if "benchmarkCategory" in resolved:
-            if resolved.get("benchmarkCategory_is_fuzzy"):
-                or_filters.append({"benchmarkCategory": resolved["benchmarkCategory"]})
+        if "benchmarkCategory" in resolved_search:
+            cat_val = resolved_search["benchmarkCategory"]
+            if resolved_search.get("benchmarkCategory_is_fuzzy"):
+                or_filters.append({"benchmarkCategory": cat_val})
             else:
                 or_filters.append({"benchmarkCategory": search_regex})
         
@@ -493,7 +538,13 @@ async def search_snapshots(
                 {"benchmarkCategory": search_regex}
             ])
             
-        exec_query["$or"] = or_filters
+        final_exec_filters.append({"$or": or_filters})
+
+    exec_query = {}
+    if len(final_exec_filters) > 1:
+        exec_query = {"$and": final_exec_filters}
+    elif len(final_exec_filters) == 1:
+        exec_query = final_exec_filters[0]
 
     if not exec_query:
         return {"status": "success", "data": [], "message": "No search parameters provided."}
@@ -535,3 +586,5 @@ async def search_snapshots(
         "size": size,
         "data": results
     }
+
+

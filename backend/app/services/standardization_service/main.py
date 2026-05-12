@@ -13,6 +13,7 @@ include_selected_routes(
     snapshots_router,
     {
         ("GET", "/snapshot-records/{Execution_id}"),
+        ("POST", "/snapshot-records/{Execution_id}/assign"),
     },
 )
 include_selected_routes(
@@ -21,6 +22,8 @@ include_selected_routes(
     {
         ("PUT", "/approve-suggestion"),
         ("PUT", "/reject-record"),
+        ("POST", "/reassign-records"),
+        ("GET", "/eligible-users/{Execution_id}"),
     },
 )
 add_websocket_endpoint(app)

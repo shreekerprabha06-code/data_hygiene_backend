@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import time
 import uuid
 import rapidfuzz
-from rapidfuzz import process
+from rapidfuzz import process, fuzz
 from app.core.database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from app.services.validation import build_mappings
 from app.services.ws_manager import manager
@@ -386,30 +386,56 @@ async def get_masterlist_values(field_type: str) -> List[str]:
 
 async def resolve_fuzzy_benchmarks(benchmarkType: Optional[str] = None, benchmarkCategory: Optional[str] = None) -> Dict[str, Any]:
     """Helper to resolve fuzzy benchmark terms into exact masterlist values."""
+    db = get_db()
     resolved = {}
+    
+    # Fetch valid types and categories
+    valid_types = await db[MASTERLIST_COL].distinct("data.value", {"type": "benchmarkType", "status": "Published"})
+    valid_types = [str(t) for t in valid_types if t]
+    type_map = {t.lower(): t for t in valid_types}
+    
+    valid_cats = await db[MASTERLIST_COL].distinct("data.metadata.benchmarkCategory")
+    valid_cats = [str(c) for c in valid_cats if c]
+    cat_map = {c.lower(): c for c in valid_cats}
+    
+    # Exact category match check
+    term_lower = (benchmarkCategory or "").lower().strip()
+    if term_lower in cat_map:
+        resolved["benchmarkCategory"] = cat_map[term_lower]
+        resolved["benchmarkCategory_is_fuzzy"] = False
+        return resolved
+
+    # Exact type match check
+    type_term_lower = (benchmarkType or "").lower().strip()
+    if type_term_lower in type_map:
+        resolved["benchmarkType"] = type_map[type_term_lower]
+        resolved["benchmarkType_is_fuzzy"] = False
+        return resolved
+
     if benchmarkType:
-        valid_types = await get_masterlist_values("BenchmarkType")
-        valid_map = {v.lower(): v for v in valid_types}
-        match_res = process.extractOne(benchmarkType.lower(), valid_map.keys(), score_cutoff=60)
+        match_res = process.extractOne(benchmarkType.lower(), type_map.keys(), scorer=fuzz.partial_ratio, score_cutoff=60)
         if match_res:
-             match_str = match_res[0]
-             resolved["benchmarkType"] = valid_map[match_str]
-             resolved["benchmarkType_is_fuzzy"] = True
+            match_str = match_res[0]
+            # Safety check: prevent short matching on 'lm' / 'llm' resulting in 'dlrm'
+            if benchmarkType.lower() in ["lm", "llm", "ai-llm"] and match_str == "dlrm":
+                resolved["benchmarkType"] = benchmarkType
+                resolved["benchmarkType_is_fuzzy"] = False
+            else:
+                resolved["benchmarkType"] = type_map[match_str]
+                resolved["benchmarkType_is_fuzzy"] = True
         else:
-             resolved["benchmarkType"] = benchmarkType
-             resolved["benchmarkType_is_fuzzy"] = False
+            resolved["benchmarkType"] = benchmarkType
+            resolved["benchmarkType_is_fuzzy"] = False
 
     if benchmarkCategory:
-        valid_cats = await get_masterlist_values("BenchmarkCategory")
-        valid_map = {v.lower(): v for v in valid_cats}
-        match_res = process.extractOne(benchmarkCategory.lower(), valid_map.keys(), score_cutoff=60)
+        match_res = process.extractOne(benchmarkCategory.lower(), cat_map.keys(), scorer=fuzz.partial_ratio, score_cutoff=60)
         if match_res:
-             match_str = match_res[0]
-             resolved["benchmarkCategory"] = valid_map[match_str]
-             resolved["benchmarkCategory_is_fuzzy"] = True
+            match_str = match_res[0]
+            resolved["benchmarkCategory"] = cat_map[match_str]
+            resolved["benchmarkCategory_is_fuzzy"] = True
         else:
-             resolved["benchmarkCategory"] = benchmarkCategory
-             resolved["benchmarkCategory_is_fuzzy"] = False
+            resolved["benchmarkCategory"] = benchmarkCategory
+            resolved["benchmarkCategory_is_fuzzy"] = False
     
     return resolved
 
@@ -445,3 +471,147 @@ async def _get_masterlist_all_unique_values(db):
         unique_data[param] = sorted(list(set(str(v).strip() for v in values if v is not None)))
     
     return unique_data
+
+
+# ============================================================================
+# RBAC SECURITY & WORKLOAD AUTO-ASSIGNMENT HELPERS
+# ============================================================================
+
+SECRET_KEY = "super-secret-key-for-data-hygiene"
+ALGORITHM = "HS256"
+
+from fastapi import Request, HTTPException, Depends
+import jwt
+
+async def build_expertise_query_filter(expert_cats: list, db, username: Optional[str] = None, assigned_only: bool = False) -> dict:
+    """
+    Builds a MongoDB query filter for Executioninfo records strictly based on raw benchmarkCategory.
+    If assigned_only is True, filters to records assigned to the specified user.
+    """
+    if not expert_cats:
+        return {}
+        
+    or_conditions = []
+    for cat in expert_cats:
+        if not cat:
+            continue
+        cat_str = str(cat).strip()
+        cat_regex = {"$regex": f"^{cat_str}$", "$options": "i"}
+        
+        # Strictly direct match on raw benchmarkCategory in the execution records
+        cond = {"benchmarkCategory": cat_regex}
+        if assigned_only and username:
+            cond["assignment.assigned_sme"] = username
+        or_conditions.append(cond)
+            
+    if or_conditions:
+        return {"$or": or_conditions}
+    return {}
+
+def get_current_user(request: Request) -> dict:
+    """
+    Decodes the JWT token from the Authorization header to extract user claims.
+    Falls back to a default 'tester' SME user if no Authorization header is present
+    to ensure full backward compatibility with local scripts and unauthenticated requests.
+    """
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        # Fallback to default user to avoid breaking legacy/unauthenticated requests
+        return {
+            "username": "tester",
+            "role": "SME",
+            "expertise": ["OSS", "Database", "Cloud"],
+            "benchmarkCategories": ["OSS", "Database", "Cloud"]
+        }
+        
+    token = auth_header.split(" ")[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return {
+            "username": payload.get("sub"),
+            "role": payload.get("role", "SME"),
+            "expertise": payload.get("benchmarkCategories", payload.get("expertise", [])),
+            "benchmarkCategories": payload.get("benchmarkCategories", payload.get("expertise", []))
+        }
+    except Exception:
+        raise HTTPException(status_code=401, detail="Session expired or invalid signature")
+
+
+async def auto_assign_records(db, record_ids):
+    """
+    Automatically assigns records to the least-loaded respective active SMEs and Admins based on benchmarkCategory expertise.
+    If no specialized SME/Admin is found, it remains unassigned.
+    Optimized: Employs in-memory workload caching to distribute large uploaded batches (e.g., 400 records) instantly and equally.
+    """
+    # Pre-cache all active SMEs and Admins (case-insensitive roles)
+    users_cursor = db["users"].find({"role": {"$in": ["SME", "Admin", "ADMIN", "sme"]}, "status": "Active"})
+    all_users = await users_cursor.to_list(length=100)
+    
+    if not all_users:
+        print("No active SMEs or Admins found for automatic assignment.")
+        return
+
+    # Fetch initial workload for all active users once (extremely fast)
+    user_workloads = {}
+    for u in all_users:
+        assignee_id = u.get("email") or u.get("username")
+        load = await db[EXECUTION_INFO_COL].count_documents({
+            "$or": [
+                {"tester": assignee_id},
+                {"assignment.assigned_sme": assignee_id}
+            ],
+            "stage": {"$ne": "standardization completed"}
+        })
+        user_workloads[assignee_id] = load
+
+    # Fetch all records to assign
+    cursor = db[EXECUTION_INFO_COL].find({"_id": {"$in": record_ids}})
+    records = await cursor.to_list(length=len(record_ids))
+    
+    for rec in records:
+        category = rec.get("benchmarkCategory")
+        if not category:
+            continue
+            
+        # Find active users expert in this category (case-insensitive)
+        eligible_users = []
+        for u in all_users:
+            expert_list = [str(x).strip().lower() for x in u.get("benchmarkCategories", u.get("expertise", []))]
+            if category.lower() in expert_list:
+                eligible_users.append(u)
+                
+        if not eligible_users:
+            print(f"No eligible SMEs or Admins found for category '{category}' for record {rec.get('benchmarkExecutionID')}")
+            continue
+            
+        # Find the least loaded eligible user using in-memory loads
+        least_loaded_user = None
+        min_load = float("inf")
+        
+        for u in eligible_users:
+            assignee_id = u.get("email") or u.get("username")
+            load = user_workloads.get(assignee_id, 0)
+            if load < min_load:
+                min_load = load
+                least_loaded_user = assignee_id
+                
+        if least_loaded_user:
+            # Increment workload in-memory so subsequent iterations see this assignment immediately
+            user_workloads[least_loaded_user] += 1
+            
+            print(f"Auto-assigning record {rec.get('benchmarkExecutionID')} to user: {least_loaded_user} (In-Memory Load: {min_load})")
+            
+            # Assign to the selected least-loaded user in the DB
+            await db[EXECUTION_INFO_COL].update_one(
+                {"_id": rec["_id"]},
+                {"$set": {
+                    "tester": least_loaded_user,  # Standardized to use email as tester
+                    "assignment": {
+                        "status": "ASSIGNED",
+                        "assigned_sme": least_loaded_user,
+                        "assigned_at": datetime.utcnow().isoformat(),
+                        "proposals": [],
+                        "feedback": None
+                    }
+                }}
+            )

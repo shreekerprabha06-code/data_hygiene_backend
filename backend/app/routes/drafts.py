@@ -2,7 +2,7 @@
 Draft & Upload Routes
 Handles: /draft-executions, /draft-records/{type_name}, /draft-records/fields, /upload-execution-data
 """
-from fastapi import APIRouter, Query, HTTPException, File, UploadFile
+from fastapi import APIRouter, Query, HTTPException, File, UploadFile, Depends
 from typing import Dict, Any
 from datetime import datetime
 import json
@@ -10,7 +10,8 @@ import uuid
 from app.core.database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from app.schemas.models import DraftRecordRequest
 from app.services.helpers import (
-    _check_duplicate, _build_base_ml_doc, get_dynamic_draft_fields, broadcast_summary
+    _check_duplicate, _build_base_ml_doc, get_dynamic_draft_fields, broadcast_summary,
+    get_current_user, auto_assign_records
 )
 
 router = APIRouter()
@@ -41,12 +42,25 @@ async def get_draft_executions():
     return exec_ids
 
 @router.post("/draft-records/{type_name}")
-async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
+async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest, user: dict = Depends(get_current_user)):
     """
     Unified endpoint to add a new masterlist record to "In Review" status.
     Now fully dynamic: discovers schema and mappings from existing masterlist records.
     """
     db = get_db()
+    
+    # Enforce SME assignment restriction: SMEs can only edit/draft on records assigned strictly to them
+    if user.get("role") == "SME":
+        exec_id = draft.execution_id
+        if exec_id:
+            record = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": exec_id})
+            if record:
+                assigned_sme = record.get("assignment", {}).get("assigned_sme")
+                if assigned_sme != user.get("username"):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Access Denied: Record {exec_id} is not assigned to you."
+                    )
     
     # 1. Discover Schema and Resolve Actual Type
     schema = await get_dynamic_draft_fields(type_name)
@@ -209,6 +223,9 @@ async def upload_execution_data(file: UploadFile = File(...)):
             {"_id": {"$in": result.inserted_ids}},
             {"$set": {"stage": "validation initiated", "lastModifiedOn": datetime.utcnow().isoformat()}}
         )
+        
+        # Trigger automatic workload assignment to expert SMEs
+        await auto_assign_records(db, result.inserted_ids)
         
         # Broadcast the updated summary so the dashboard reflects the new records instantly
         await broadcast_summary(db)

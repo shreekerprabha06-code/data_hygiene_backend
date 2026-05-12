@@ -10,7 +10,8 @@ include_selected_routes(
     auth_router,
     {
         ("POST", "/login"),
-        ("GET", "/verify")
+        ("GET", "/verify"),
+        ("POST", "/register")
     },
 )
 

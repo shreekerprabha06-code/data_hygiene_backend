@@ -2,7 +2,7 @@
 Summary & Dashboard Routes
 Handles: /invalid-summary, /summary-poll, /invalid-summary/batch, /validation-counts
 """
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 import time
@@ -12,7 +12,8 @@ from app.services.validation import build_mappings
 from app.services.pipeline import get_current_summary
 from app.services.helpers import (
     resolve_fuzzy_benchmarks, get_dynamic_age_counts,
-    _get_dynamic_field_map, _report_cache, CACHE_TTL
+    _get_dynamic_field_map, _report_cache, CACHE_TTL, get_current_user,
+    build_expertise_query_filter
 )
 
 router = APIRouter()
@@ -25,7 +26,9 @@ async def get_invalid_summary(
     stage: Optional[str] = Query(None, description="Filter by pipeline stage: VALIDATION_INPROGRESS, STANDARDIZATION_COMPLETED, etc."),
     age: Optional[str] = Query(None, description="Filter by age: green, yellow, or red"),
     page: int = Query(1, ge=1), 
-    size: int = Query(50, ge=1, le=500)
+    size: int = Query(50, ge=1, le=500),
+    assigned_only: Optional[str] = Query(None, description="If 'true', only returns records assigned to the logged-in user"),
+    user: dict = Depends(get_current_user)
 ):
     """
     Returns strictly the Execution_id and the names of the specific fields that are invalid.
@@ -34,13 +37,33 @@ async def get_invalid_summary(
     db = get_db()
     
     # 1. Search Filter (applies to all queries)
-    search_query = {}
+    final_search_filters = []
+    
+    role = user.get("role", "").upper()
+    is_assigned_only = str(assigned_only).lower() == "true"
+    
+    if role == "SME":
+        expert_cats = user.get("benchmarkCategories", user.get("expertise", []))
+        exp_filter = await build_expertise_query_filter(expert_cats, db, username=user.get("username"), assigned_only=is_assigned_only)
+        if exp_filter:
+            final_search_filters.append(exp_filter)
+    elif role == "ADMIN" and is_assigned_only:
+        assignee_matches = []
+        u_name = user.get("username")
+        u_email = user.get("email")
+        if u_name:
+            assignee_matches.extend([{"tester": u_name}, {"assignment.assigned_sme": u_name}])
+        if u_email:
+            assignee_matches.extend([{"tester": u_email}, {"assignment.assigned_sme": u_email}])
+        if assignee_matches:
+            final_search_filters.append({"$or": assignee_matches})
+            
     if search:
         # Optimization: If search looks like a full UUID, do an exact match first (super fast)
         is_uuid = len(search) == 36 and search.count("-") == 4
         
         if is_uuid:
-            search_query["benchmarkExecutionID"] = search
+            final_search_filters.append({"benchmarkExecutionID": search})
         else:
             search_regex = {"$regex": search, "$options": "i"}
             resolved = await resolve_fuzzy_benchmarks(benchmarkType=search, benchmarkCategory=search)
@@ -53,8 +76,9 @@ async def get_invalid_summary(
                     or_filters.append({"benchmarkType": search_regex})
            
             if "benchmarkCategory" in resolved:
+                cat_val = resolved["benchmarkCategory"]
                 if resolved.get("benchmarkCategory_is_fuzzy"):
-                    or_filters.append({"benchmarkCategory": resolved["benchmarkCategory"]})
+                    or_filters.append({"benchmarkCategory": cat_val})
                 else:
                     or_filters.append({"benchmarkCategory": search_regex})
                    
@@ -64,7 +88,13 @@ async def get_invalid_summary(
                     {"benchmarkCategory": search_regex}
                 ])
                
-            search_query["$or"] = or_filters
+            final_search_filters.append({"$or": or_filters})
+
+    search_query = {}
+    if len(final_search_filters) > 1:
+        search_query = {"$and": final_search_filters}
+    elif len(final_search_filters) == 1:
+        search_query = final_search_filters[0]
 
     # 4. Business Status Pre-Fetch Filter (Replaces heavy $lookup)
     status_condition = {}
@@ -238,6 +268,7 @@ async def get_invalid_summary(
                 "ExecutionId": doc.get("benchmarkExecutionID"),
                 "Status": status_val,
                 "Stage": doc.get("stage", "validation inprogress"),
+                "tester": doc.get("tester") or doc.get("assignment", {}).get("assigned_sme", ""),
                 "BenchmarkType": doc.get("benchmarkType", "N/A"),
                 "BenchmarkCategory": doc.get("benchmarkCategory", "N/A"),
                 "InvalidFields": invalid_fields,
@@ -264,9 +295,19 @@ async def get_invalid_summary(
             return {"red": _cached.get("red", 0), "yellow": _cached.get("yellow", 0), "green": _cached.get("green", 0)}
         else:
             age_search_query = {}
-            is_uuid = len(search) == 36 and search.count("-") == 4
-            if is_uuid: age_search_query["benchmarkExecutionID"] = search
-            else: age_search_query["benchmarkExecutionID"] = {"$regex": search, "$options": "i"}
+            if "benchmarkCategory" in search_query:
+                age_search_query["benchmarkCategory"] = search_query["benchmarkCategory"]
+                
+            if search:
+                is_uuid = len(search) == 36 and search.count("-") == 4
+                if is_uuid: 
+                    age_search_query["benchmarkExecutionID"] = search
+                else: 
+                    age_search_query["$or"] = [
+                        {"benchmarkExecutionID": {"$regex": search, "$options": "i"}},
+                        {"benchmarkType": {"$regex": search, "$options": "i"}},
+                        {"benchmarkCategory": {"$regex": search, "$options": "i"}}
+                    ]
             return await get_dynamic_age_counts(db, age_search_query)
 
     async def _fetch_stage_counts():

@@ -2,23 +2,33 @@
 Suggestion & Rejection Routes
 Handles: /approve-suggestion, /reject-record
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, Any
 from datetime import datetime
 from app.core.database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from app.schemas.models import ApproveSuggestionRequest, RejectRecordRequest
 from app.services.ws_manager import manager
 from app.services.helpers import (
-    get_masterlist_mappings, broadcast_summary, _set_nested_key
+    get_masterlist_mappings, broadcast_summary, _set_nested_key, get_current_user
 )
 
 router = APIRouter()
 
 
 @router.put("/approve-suggestion")
-async def approve_suggestion(req: ApproveSuggestionRequest):
+async def approve_suggestion(req: ApproveSuggestionRequest, user: dict = Depends(get_current_user)):
     try:
         db = get_db()
+        
+        # Enforce record assignment restriction: both SMEs and Admins can edit only records assigned to them
+        exec_meta = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": req.execution_id})
+        assigned_user = exec_meta.get("tester") or (exec_meta.get("assignment", {}).get("assigned_sme") if exec_meta else None)
+        if user.get("role", "").upper() in ["SME", "ADMIN"]:
+            if not exec_meta or (assigned_user != user.get("username") and assigned_user != user.get("email")):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Access Denied: Record {req.execution_id} is assigned to {assigned_user or 'no one'}. You can only modify records assigned to you."
+                )
    
         # 1. Fetch Snapshot
         snap = await db[SNAPSHOT_COL].find_one({"execution_id": req.execution_id})
@@ -26,6 +36,20 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
             return {"status": "error", "message": f"Snapshot not found for Execution ID: {req.execution_id}"}
        
         snap_data = snap["data"][0]
+        
+        # Enforce on-hold approval constraint: Only Admins can approve on-hold requests
+        is_on_hold = snap_data.get("standardization_status") == "ON HOLD"
+        if not is_on_hold:
+            for item in snap_data.get("invalidValues", []):
+                if item.get("currentStatus") == "ON HOLD":
+                    is_on_hold = True
+                    break
+                    
+        if is_on_hold and user.get("role") != "ADMIN":
+            raise HTTPException(
+                status_code=403,
+                detail="Access Denied: Only Admins can approve on-hold requests."
+            )
         invalid_values = snap_data.get("invalidValues", [])
        
         # 2. Identify the selected field and suggestion (supporting nested metadata)
@@ -503,6 +527,8 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
             "mapping_path": target_mapping,
             "value_source": value_source
         }
+    except HTTPException as e:
+        raise e
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
@@ -518,7 +544,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
  
 
 @router.put("/reject-record")
-async def reject_record(req: RejectRecordRequest):
+async def reject_record(req: RejectRecordRequest, user: dict = Depends(get_current_user)):
     """
     Manually rejects an entire record that cannot be standardized.
     Marks all suggestions as 'Rejected' and sets the standardization status to 'REJECTED'.
@@ -526,6 +552,16 @@ async def reject_record(req: RejectRecordRequest):
     """
     db = get_db()
     execution_id = req.execution_id
+    
+    # Enforce record assignment restriction: both SMEs and Admins can edit/reject only records assigned to them
+    exec_meta = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": execution_id})
+    assigned_user = exec_meta.get("tester") or (exec_meta.get("assignment", {}).get("assigned_sme") if exec_meta else None)
+    if user.get("role", "").upper() in ["SME", "ADMIN"]:
+        if not exec_meta or (assigned_user != user.get("username") and assigned_user != user.get("email")):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access Denied: Record {execution_id} is assigned to {assigned_user or 'no one'}. You can only modify records assigned to you."
+            )
     
     # 1. Fetch Snapshot
     snap = await db[SNAPSHOT_COL].find_one({"execution_id": execution_id})
@@ -586,3 +622,5 @@ async def reject_record(req: RejectRecordRequest):
         "execution_id": execution_id,
         "standardization_status": "REJECTED"
     }
+
+

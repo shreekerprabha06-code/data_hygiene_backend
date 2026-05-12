@@ -418,13 +418,28 @@ async def standardize_document(db, validator, doc):
         # Mark as Completed and remove legacy/internal fields
         # IMPORTANT: This must happen BEFORE the broadcast to avoid race conditions
         # where the UI fetches the record before the DB is updated.
+        # Fetch the assigned user's email ID
+        assigned_sme = doc.get("assignment", {}).get("assigned_sme") or doc.get("tester")
+        email_val = None
+        if assigned_sme:
+            user_doc = await db["users"].find_one({"username": assigned_sme})
+            if user_doc:
+                email_val = user_doc.get("email")
+
+        # Mark as Completed and remove legacy/internal fields
+        # IMPORTANT: This must happen BEFORE the broadcast to avoid race conditions
+        # where the UI fetches the record before the DB is updated.
+        set_payload = {
+            "stage": "standardization completed",
+            "lastModifiedOn": datetime.now(timezone.utc).isoformat()
+        }
+        if email_val:
+            set_payload["tester"] = email_val
+
         await db[EXECUTION_INFO_COL].update_one(
             {"_id": doc["_id"]},
             {
-                "$set": {
-                    "stage": "standardization completed",
-                    "lastModifiedOn": datetime.now(timezone.utc).isoformat()
-                },
+                "$set": set_payload,
                 "$unset": {
                     "validated": "",
                     "standardized": "",
