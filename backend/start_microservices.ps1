@@ -13,6 +13,8 @@ if (Test-Path ".\.venv\Scripts\python.exe") {
     $Python = Join-Path $BackendDir ".venv\Scripts\python.exe"
 } elseif (Test-Path ".\venv\Scripts\python.exe") {
     $Python = Join-Path $BackendDir "venv\Scripts\python.exe"
+} elseif (Get-Command py -ErrorAction SilentlyContinue) {
+    $Python = "py"
 } else {
     $Python = "python"
 }

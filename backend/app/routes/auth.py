@@ -112,7 +112,7 @@ async def login(credentials: LoginRequest):
     benchmark_categories = await resolve_expertise_from_db(raw_categories, db)
     
     # Generate JWT Token (expires in 24 hours) with embedded claims
-    expiration = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+    expiration = datetime.datetime.utcnow() + datetime.timedelta(seconds=10)
     token_payload = {
         "sub": username,
         "role": role,
