@@ -489,7 +489,8 @@ async def build_expertise_query_filter(expert_cats: list, db, username: Optional
     If assigned_only is True, filters to records assigned to the specified user.
     """
     if not expert_cats:
-        return {}
+        # If an SME has no categories, they should see NOTHING by default
+        return {"_id": "force_empty_result_no_expertise"}
         
     or_conditions = []
     for cat in expert_cats:
@@ -516,13 +517,7 @@ def get_current_user(request: Request) -> dict:
     """
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
-        # Fallback to default user to avoid breaking legacy/unauthenticated requests
-        return {
-            "username": "tester",
-            "role": "SME",
-            "expertise": ["OSS", "Database", "Cloud"],
-            "benchmarkCategories": ["OSS", "Database", "Cloud"]
-        }
+        raise HTTPException(status_code=401, detail="Authentication required. Please provide a Bearer token.")
         
     token = auth_header.split(" ")[1]
     try:
