@@ -184,7 +184,7 @@ async def get_draft_record_fields(type: str = Query(..., description="Record typ
     }
 
 @router.post("/upload-execution-data")
-async def upload_execution_data(file: UploadFile = File(...)):
+async def upload_execution_data(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     """
     Receives a JSON file, parses it, assigns each record a new UUID as benchmarkExecutionID,
     and inserts them into ExecutionInfo.

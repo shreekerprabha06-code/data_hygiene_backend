@@ -355,7 +355,7 @@ async def get_invalid_summary(
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @router.get("/summary-poll")
-async def get_summary_poll():
+async def get_summary_poll(user: dict = Depends(get_current_user)):
     """
     Fallback endpoint for environments where WebSockets are blocked.
     Returns the same flattened summary structure as the WebSocket broadcast.
@@ -373,7 +373,7 @@ async def get_summary_poll():
 
 
 @router.get("/validation-counts")
-async def get_validation_counts():
+async def get_validation_counts(user: dict = Depends(get_current_user)):
     """
     Asynchronously returns the count of valid, invalid, and missing data for all mapped parameters.
     Dynamically discovers parameter types from the masterlist.

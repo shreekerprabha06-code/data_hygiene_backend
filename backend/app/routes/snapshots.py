@@ -325,7 +325,7 @@ async def get_snapshot_records(Execution_id: str, user: dict = Depends(get_curre
 
 
 @router.get("/metadata-values/{type_name}/{value}")
-async def get_metadata_for_value(type_name: str, value: str):
+async def get_metadata_for_value(type_name: str, value: str, user: dict = Depends(get_current_user)):
     """
     Given a primary field type (e.g. 'CPUModel') and a selected value (e.g. '7543'),
     returns all metadata configurations associated with that value from the masterlist,
@@ -400,7 +400,7 @@ async def get_metadata_for_value(type_name: str, value: str):
 
 
 @router.get("/unique-values")
-async def get_unique_values(parameterName: Optional[str] = Query(None)):
+async def get_unique_values(parameterName: Optional[str] = Query(None), user: dict = Depends(get_current_user)):
     """
     Fetches unique values for all validated parameters from the masterlist collection.
     Now fully dynamic: discovers all field paths from the masterlist structure.
