@@ -1,0 +1,86 @@
+print("[MAIN] MAIN.PY IS RUNNING")
+
+import os
+import uvicorn
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+from fastapi.middleware.cors import CORSMiddleware
+from app.api import router as api_router
+from app.core.database import get_db
+from app.services.ws_manager import manager
+from app.services.pipeline import run_trigger
+
+app = FastAPI(
+    title="Data Hygiene Validation API",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# REAL-TIME WEBSOCKET ENDPOINT
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    Handles real-time dashboard updates. 
+    Registers clients with the ConnectionManager to receive broadcasted progress updates.
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep the connection alive and wait for client heartbeats/messages
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WS Error: {e}")
+        manager.disconnect(websocket)
+
+# REST routes
+app.include_router(api_router)
+
+# Startup
+@app.on_event("startup")
+async def startup():
+    print("[STARTUP] Data Hygiene API: Startup Sequence Initiated")
+    db = get_db()
+
+    # Ensure benchmarkExecutionID is always unique at the DB level
+    from app.core.database import EXECUTION_INFO_COL, SNAPSHOT_COL
+    try:
+        await db[EXECUTION_INFO_COL].create_index("benchmarkExecutionID", unique=True, name="benchmarkExecutionID_1")
+    except Exception:
+        pass  # Index already exists
+    
+    # Performance indexes for invalid-summary API
+    try:
+        await db[EXECUTION_INFO_COL].create_index([("stage", 1), ("lastModifiedOn", -1)])
+    except Exception:
+        pass  # Index already exists
+    try:
+        await db[SNAPSHOT_COL].create_index("execution_id")
+    except Exception:
+        pass  # Index already exists
+    print("[OK] All indexes enforced")
+
+    # START BACKGROUND PIPELINES
+    # Validation & Standardization runners are async and safe to run here.
+    asyncio.create_task(run_trigger())
+    print("[OK] Background Pipelines: Validation & Standardization Started")
+
+# Shutdown
+@app.on_event("shutdown")
+async def shutdown():
+    from app.core.database import close_db
+    close_db()
+    print("[SHUTDOWN] Data Hygiene API: Shutdown Complete")
+
+# Run
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8005, reload=True)

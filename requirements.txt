@@ -1,0 +1,12 @@
+pymongo
+fastapi
+uvicorn[standard]
+motor
+python-dotenv
+rapidfuzz
+python-multipart
+websockets
+httpx
+sentence-transformers
+faiss-cpu
+PyJWT
